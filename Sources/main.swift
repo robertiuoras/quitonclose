@@ -263,10 +263,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 ///
 /// Run:  /Applications/QuitOnClose.app/Contents/MacOS/QuitOnClose --selftest
 func runSelfTest() -> Never {
+    // Mirror everything to a log file: when the test is started with `open -a`
+    // so that launchd owns the process (the only way TCC judges QuitOnClose
+    // itself rather than the shell that spawned it), stdout goes nowhere.
+    let logURL = URL(fileURLWithPath: NSHomeDirectory())
+        .appendingPathComponent("Library/Logs/QuitOnClose-selftest.log")
+
+    func say(_ message: String) {
+        print(message)
+        let line = message + "\n"
+        if let handle = try? FileHandle(forWritingTo: logURL) {
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+            try? handle.close()
+        } else {
+            try? line.write(to: logURL, atomically: true, encoding: .utf8)
+        }
+    }
+
     func fail(_ message: String) -> Never {
-        print("FAIL: \(message)")
+        say("FAIL: \(message)")
         exit(1)
     }
+
+    try? FileManager.default.removeItem(at: logURL)
+    say("--- selftest start, AXIsProcessTrusted=\(AXIsProcessTrusted())")
 
     guard AXIsProcessTrusted() else {
         fail("no Accessibility permission. Enable QuitOnClose in System Settings > Privacy & Security > Accessibility, then rerun.")
@@ -297,7 +318,7 @@ func runSelfTest() -> Never {
     textEdit()?.terminate()
     _ = wait(seconds: 5) { textEdit() == nil }
 
-    print("1. opening TextEdit ...")
+    say("1. opening TextEdit ...")
     guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: target) else {
         fail("TextEdit not found on this Mac")
     }
@@ -307,12 +328,12 @@ func runSelfTest() -> Never {
         fail("TextEdit never showed a window the Accessibility API could see")
     }
     guard let app = textEdit() else { fail("TextEdit vanished") }
-    print("   TextEdit pid \(app.processIdentifier), windows=\(monitor.windowCount(app.processIdentifier) ?? -1)")
+    say("   TextEdit pid \(app.processIdentifier), windows=\(monitor.windowCount(app.processIdentifier) ?? -1)")
 
     // Let the Monitor's launch grace period elapse, then close the window.
     _ = wait(seconds: launchGrace + 1) { false }
 
-    print("2. closing its last window ...")
+    say("2. closing its last window ...")
     let axApp = AXUIElementCreateApplication(app.processIdentifier)
     var windowsRef: CFTypeRef?
     guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
@@ -326,12 +347,12 @@ func runSelfTest() -> Never {
     let pressed = AXUIElementPerformAction(closeButton as! AXUIElement, kAXPressAction as CFString)
     guard pressed == .success else { fail("pressing the close button failed (\(pressed.rawValue))") }
 
-    print("3. waiting for QuitOnClose to terminate it ...")
+    say("3. waiting for QuitOnClose to terminate it ...")
     let start = Date()
     guard wait(seconds: 10, for: { textEdit() == nil }) else {
         fail("TextEdit is still running 10s after its last window closed")
     }
-    print(String(format: "PASS: TextEdit quit %.2fs after its last window closed", Date().timeIntervalSince(start)))
+    say(String(format: "PASS: TextEdit quit %.2fs after its last window closed", Date().timeIntervalSince(start)))
     try? FileManager.default.removeItem(at: scratch)
     exit(0)
 }
