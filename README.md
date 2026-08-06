@@ -37,10 +37,27 @@ Deliberate choices:
 ## Verify it works
 
 ```bash
-/Applications/QuitOnClose.app/Contents/MacOS/QuitOnClose --selftest
+pkill -x QuitOnClose
+open -a /Applications/QuitOnClose.app --args --selftest
+sleep 12 && cat ~/Library/Logs/QuitOnClose-selftest.log
+open -a /Applications/QuitOnClose.app        # back to normal
 ```
 
-Opens TextEdit on a scratch file, presses that window's close button through the Accessibility API, and waits for QuitOnClose to terminate TextEdit. Prints `PASS` with the measured delay, or `FAIL` with the reason. It uses a temporary in-memory setting, so your saved app list is untouched.
+Opens TextEdit on a scratch file, presses that window's close button through the Accessibility API, and waits for QuitOnClose to terminate TextEdit. Writes `PASS` with the measured delay, or `FAIL` with the reason. It uses a temporary in-memory setting, so your saved app list is untouched. Sample run on macOS 26.5:
+
+```
+--- selftest start, AXIsProcessTrusted=true
+1. opening TextEdit ...
+   TextEdit pid 52448, windows=1
+2. closing its last window ...
+3. waiting for QuitOnClose to terminate it ...
+PASS: TextEdit quit 1.25s after its last window closed
+```
+
+Two things that look like bugs but are macOS being macOS:
+
+- **Launch it with `open -a`, not by running the binary from a shell.** For a shell-spawned executable, TCC attributes the Accessibility request to the parent terminal, so the test reports "no Accessibility permission" even when QuitOnClose is ticked. `open` makes launchd the responsible process. QuitOnClose must not already be running, or `open` just activates the existing instance and drops the argument.
+- **After a rebuild, the permission is silently dead.** The Accessibility grant is bound to the ad-hoc code signature, so a new build keeps the ticked checkbox but is no longer authorized. Fix with `tccutil reset Accessibility com.quitonclose.app`, then relaunch the app and accept the prompt again.
 
 `Tests/axprobe.swift` is a smaller probe that just prints the window count seen for every running app.
 
