@@ -69,3 +69,7 @@ Two things that look like bugs but are macOS being macOS:
 ## License
 
 MIT
+
+---
+
+Built by [taskdriver.ai](https://taskdriver.ai) — we build and run AI systems in production. Free tools like this one are a side effect.
