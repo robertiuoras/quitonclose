@@ -20,8 +20,8 @@ Then grant one permission: **System Settings > Privacy & Security > Accessibilit
 
 Click the menu-bar icon. Every running app is listed, split into two groups:
 
-- **Recommended** — apps QuitOnClose has watched sitting alive with no window open. That is exactly the behaviour this tool fixes, so these are the ones worth ticking. "Tick all recommended" turns on the whole group at once.
-- **Other running apps** — everything else. Apps that keep doing real work with no window (Spotify keeps playing, Docker runs containers, Dropbox syncs, a VPN holds the tunnel up) are listed here with the reason and are never recommended.
+- **Recommended**: apps QuitOnClose has watched sitting alive with no window open. That is exactly the behaviour this tool fixes, so these are the ones worth ticking. "Tick all recommended" turns on the whole group at once.
+- **Other running apps**: everything else. Apps that keep doing real work with no window (Spotify keeps playing, Docker runs containers, Dropbox syncs, a VPN holds the tunnel up) are listed here with the reason and are never recommended.
 
 **The menu stays open while you tick**, so you can select many apps in one go instead of reopening it after every click. It closes on Escape or a click elsewhere, like any menu.
 
@@ -53,7 +53,7 @@ Two tests. The menu one needs no permissions and runs anywhere:
 /Applications/QuitOnClose.app/Contents/MacOS/QuitOnClose --menutest
 ```
 
-It opens a real menu, warps the pointer onto a row, posts two clicks into the menu's own tracking loop, and asserts the menu was still open afterwards, that the first click ticked the row and the second unticked it — plus five checks on the recommendation rules. Sample run on macOS 26.5:
+It opens a real menu, warps the pointer onto a row, posts two clicks into the menu's own tracking loop, and asserts the menu was still open afterwards, that the first click ticked the row and the second unticked it, plus five checks on the recommendation rules. Sample run on macOS 26.5:
 
 ```
 ok   Spotify is never recommended (keeps playing)
@@ -106,4 +106,4 @@ MIT
 
 ---
 
-Built by [taskdriver.ai](https://taskdriver.ai) — we build and run AI systems in production. Free tools like this one are a side effect.
+Built by [taskdriver.ai](https://taskdriver.ai). We build and run AI systems in production. Free tools like this one are a side effect.

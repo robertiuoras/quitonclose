@@ -447,7 +447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if !recommended.isEmpty {
             menu.addItem(.separator())
-            menu.addItem(header("Recommended — these stay running with no window"))
+            menu.addItem(header("Recommended: these stay running with no window"))
             for (id, name, icon) in recommended {
                 menu.addItem(row(bundleID: id, title: name, icon: icon, note: "recommended", recommended: true))
             }
