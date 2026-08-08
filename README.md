@@ -18,13 +18,24 @@ Then grant one permission: **System Settings > Privacy & Security > Accessibilit
 
 ## Use
 
-Click the menu-bar icon. Every running app is listed; tick the ones that should quit when their last window closes. The list is saved, so an app stays ticked after a reboot. Apps you ticked that are not running now appear under "Enabled but not running" so you can untick them.
+Click the menu-bar icon. Every running app is listed, split into two groups:
+
+- **Recommended** — apps QuitOnClose has watched sitting alive with no window open. That is exactly the behaviour this tool fixes, so these are the ones worth ticking. "Tick all recommended" turns on the whole group at once.
+- **Other running apps** — everything else. Apps that keep doing real work with no window (Spotify keeps playing, Docker runs containers, Dropbox syncs, a VPN holds the tunnel up) are listed here with the reason and are never recommended.
+
+**The menu stays open while you tick**, so you can select many apps in one go instead of reopening it after every click. It closes on Escape or a click elsewhere, like any menu.
+
+The list is saved, so an app stays ticked after a reboot. Apps you ticked that are not running now appear under "Ticked but not running" so you can untick them. "Untick everything" clears the lot.
 
 "Open at Login" registers the app with `SMAppService`, macOS's supported login-item API.
 
 ## How it works
 
 Every 0.5s it reads `kAXWindowsAttribute` for each ticked app and counts elements whose role is `AXWindow`. When that count goes from above zero to zero for two consecutive polls, it calls `terminate()` on the app, the same graceful quit as Cmd-Q, so an app with unsaved work still gets to ask you.
+
+Every 5s it also checks *every* running app, ticked or not, and adds up how long each one has spent alive with no window. Past 15 seconds an app is marked "recommended": an app that quits itself on its last window close never accumulates any, so it never appears there. That total is capped and saved, so the advice is ready the moment you open the menu after a reboot.
+
+The rows are custom-drawn views rather than plain `NSMenuItem`s. A plain menu item dismisses the menu the instant it is clicked, which makes ticking six apps six trips to the menu bar; a menu item carrying a view receives the click itself and the menu stays open. Each row declares itself to VoiceOver as a checkbox so nothing is lost by drawing it by hand.
 
 Deliberate choices:
 
@@ -35,6 +46,29 @@ Deliberate choices:
 - Finder, Dock, Control Center, SystemUIServer, Notification Center and the login window can never be ticked.
 
 ## Verify it works
+
+Two tests. The menu one needs no permissions and runs anywhere:
+
+```bash
+/Applications/QuitOnClose.app/Contents/MacOS/QuitOnClose --menutest
+```
+
+It opens a real menu, warps the pointer onto a row, posts two clicks into the menu's own tracking loop, and asserts the menu was still open afterwards, that the first click ticked the row and the second unticked it — plus five checks on the recommendation rules. Sample run on macOS 26.5:
+
+```
+ok   Spotify is never recommended (keeps playing)
+ok   prefix match catches Docker
+ok   an app with no evidence is not recommended
+ok   an app seen windowless past the threshold is recommended
+ok   the observation total is capped, so it cannot grow forever
+ok   both clicks were delivered while the menu was open (2/2)
+ok   the menu stayed open through the clicks (open 2.31s, closed by the test: yes)
+ok   the first click ticked the row
+ok   the second click unticked it again
+PASS: 4 menu checks and 5 advice checks
+```
+
+The end-to-end one proves an app really gets quit, and needs Accessibility:
 
 ```bash
 pkill -x QuitOnClose
