@@ -1,3 +1,5 @@
+<img src="Assets/icon-1024.png" alt="" width="128" align="right">
+
 # QuitOnClose
 
 A tiny macOS menu-bar utility that quits an app the moment you close its last window. Free, open source, no trial, ~300 lines of Swift.
@@ -99,6 +101,21 @@ Two things that look like bugs but are macOS being macOS:
 
 - The build is ad-hoc signed. macOS ties Accessibility permission to the code signature, so after a rebuild you may have to remove and re-add QuitOnClose in the Accessibility list.
 - Not sandboxed and not notarized, so `spctl -a` reports `rejected`. It still launches without any Gatekeeper dialog because a binary you compile locally carries no `com.apple.quarantine` attribute, and Gatekeeper's launch check applies to quarantined items. Measured on macOS 26.5 with SIP enabled: no quarantine attribute after `./build.sh --install`, app launched and ran. If you instead download a prebuilt copy from the internet, it *will* be quarantined and Gatekeeper will block it.
+
+## The icon
+
+A window with a power glyph where its content would be: close the window, quit the app.
+
+`scripts/make-icon.swift` is the only place it is drawn. One 1024 grid produces `Assets/AppIcon.icns` (every size Finder asks for), `icon-1024.png`, and `icon.svg` / `mark.svg` for the website, so the app and toolstash.xyz/quitonclose cannot drift apart. The plate is a real superellipse rather than a rounded rectangle, which is the difference between an icon that looks native on macOS and one that does not. At 32px and below the window would be eight pixels wide, so the mark drops to the power glyph alone.
+
+`Sources/MenuBarIcon.swift` draws the same mark as a template image for the menu bar, and the site redraws that geometry in SVG.
+
+```bash
+swiftc -O scripts/make-icon.swift Sources/MenuBarIcon.swift -o build/make-icon
+./build/make-icon --sheet     # build/icon-sheet.png: every size, plus the menu bar mark on light and dark
+```
+
+`build.sh` regenerates the icon only when the generator or the shared drawing code is newer than the committed `.icns`.
 
 ## License
 
