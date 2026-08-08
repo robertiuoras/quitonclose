@@ -389,8 +389,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "xmark.rectangle", accessibilityDescription: "QuitOnClose")
-            button.image?.isTemplate = true
+            button.image = makeMenuBarImage()
         }
 
         let menu = NSMenu()
