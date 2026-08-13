@@ -83,6 +83,8 @@ Opens TextEdit on a scratch file, presses that window's close button through the
 
 ```
 --- selftest start, AXIsProcessTrusted=true
+checking the app's own Accessibility grant, not this process's ...
+app-side Accessibility: granted
 1. opening TextEdit ...
    TextEdit pid 52448, windows=1
 2. closing its last window ...
@@ -90,10 +92,17 @@ Opens TextEdit on a scratch file, presses that window's close button through the
 PASS: TextEdit quit 1.25s after its last window closed
 ```
 
+Whether the app is authorized at all is its own one-line check, and it must be launched, not run from the shell, or it answers for your terminal instead:
+
+```bash
+open -n -g -a /Applications/QuitOnClose.app --args --permcheck
+cat ~/Library/Logs/QuitOnClose-permcheck.log     # true | false
+```
+
 Two things that look like bugs but are macOS being macOS:
 
-- **Launch it with `open -a`, not by running the binary from a shell.** For a shell-spawned executable, TCC attributes the Accessibility request to the parent terminal, so the test reports "no Accessibility permission" even when QuitOnClose is ticked. `open` makes launchd the responsible process. QuitOnClose must not already be running, or `open` just activates the existing instance and drops the argument.
-- **After a rebuild, the permission is silently dead.** The Accessibility grant is bound to the ad-hoc code signature, so a new build keeps the ticked checkbox but is no longer authorized. Fix with `tccutil reset Accessibility com.quitonclose.app`, then relaunch the app and accept the prompt again.
+- **TCC judges the responsible process, so a shell-spawned run answers for your terminal, in both directions.** Started from a shell with no permission anywhere, the test reports "no Accessibility permission" even when QuitOnClose is ticked. Worse, started from a terminal that *does* have Accessibility, it reports `AXIsProcessTrusted=true` and passes while the menu bar app has no grant and is quitting nothing. That false pass hid a dead permission for five days. The self test therefore always asks the app itself with `--permcheck` first and fails if that says no, whatever this process reports.
+- **After a rebuild, the permission is silently dead.** The Accessibility grant is bound to the ad-hoc code signature, so a new build keeps the ticked checkbox but is no longer authorized. Fix with `tccutil reset Accessibility com.quitonclose.app`, then relaunch the app and accept the prompt again. Ticking the switch off and on does not fix it; the stale entry has to be removed with the minus button. The menu bar icon now carries a badge dot and dims whenever the app is unauthorized, so this state is visible without opening the menu.
 
 `Tests/axprobe.swift` is a smaller probe that just prints the window count seen for every running app.
 

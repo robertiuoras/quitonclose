@@ -6,20 +6,25 @@ import AppKit
 ///
 /// Returned as a template image, so macOS tints it black on a light menu bar
 /// and white on a dark one and dims it when the menu is open.
-func makeMenuBarImage(height: CGFloat = 18) -> NSImage {
+///
+/// `warning: true` adds a badge dot to the corner. Without Accessibility the app
+/// can read no window counts at all and quits nothing, and the System Settings
+/// switch can still look ticked while the grant is stale, so that state has to
+/// be visible in the menu bar itself rather than only inside the menu.
+func makeMenuBarImage(height: CGFloat = 18, warning: Bool = false) -> NSImage {
     let size = NSSize(width: height, height: height)
     let image = NSImage(size: size, flipped: false) { _ in
-        drawMenuBarMark(in: size)
+        drawMenuBarMark(in: size, warning: warning)
         return true
     }
     image.isTemplate = true
-    image.accessibilityDescription = "QuitOnClose"
+    image.accessibilityDescription = warning ? "QuitOnClose, Accessibility permission needed" : "QuitOnClose"
     return image
 }
 
 /// Draws the mark into the current context, designed on an 18x18 grid and
 /// scaled to whatever `size` asks for. Coordinates are y-up (AppKit default).
-func drawMenuBarMark(in size: NSSize, tint: NSColor = .black) {
+func drawMenuBarMark(in size: NSSize, tint: NSColor = .black, warning: Bool = false) {
     let s = size.height / 18.0
     func p(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: x * s, y: y * s) }
 
@@ -60,4 +65,17 @@ func drawMenuBarMark(in size: NSSize, tint: NSColor = .black) {
     stem.lineWidth = lw
     stem.lineCapStyle = .round
     stem.stroke()
+
+    guard warning else { return }
+
+    // Badge: a filled dot in the top-right, sitting in a cleared moat so it
+    // reads as a separate mark rather than a lump on the window frame. The
+    // moat is punched with .clear, which a template image renders as fully
+    // transparent whatever the menu bar tint.
+    let badge = NSRect(x: 11.6 * s, y: 11.6 * s, width: 5.6 * s, height: 5.6 * s)
+    NSGraphicsContext.current?.compositingOperation = .clear
+    NSBezierPath(ovalIn: badge.insetBy(dx: -1.1 * s, dy: -1.1 * s)).fill()
+    NSGraphicsContext.current?.compositingOperation = .sourceOver
+    tint.setFill()
+    NSBezierPath(ovalIn: badge).fill()
 }

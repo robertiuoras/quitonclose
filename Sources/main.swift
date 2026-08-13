@@ -381,6 +381,8 @@ final class AppRowView: NSView {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
+    private var permissionTimer: Timer?
+    private var lastTrusted: Bool?
     private let monitor = Monitor()
     /// Recommended apps not yet ticked, filled while the menu is built so the
     /// "tick all recommended" item knows what it would turn on.
@@ -388,16 +390,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = statusItem.button {
-            button.image = makeMenuBarImage()
-        }
 
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
 
         requestAccessibilityIfNeeded()
+        refreshPermissionState()
+        // The grant can appear (the user ticks the switch) or vanish (a rebuild
+        // changes the code signature and TCC stops matching) at any moment, and
+        // there is no notification for either, so the state is polled.
+        let t = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            self?.refreshPermissionState()
+        }
+        t.tolerance = 1
+        permissionTimer = t
+
         monitor.start()
+    }
+
+    /// Keeps the menu bar honest: without Accessibility the app quits nothing at
+    /// all, and the only previous sign of that was a line inside the menu, which
+    /// is invisible until you open it.
+    private func refreshPermissionState() {
+        let trusted = AXIsProcessTrusted()
+        guard trusted != lastTrusted else { return }
+        lastTrusted = trusted
+        statusItem.button?.image = makeMenuBarImage(warning: !trusted)
+        statusItem.button?.appearsDisabled = !trusted
+        statusItem.button?.toolTip = trusted
+            ? "QuitOnClose"
+            : "QuitOnClose is not authorised: no Accessibility permission, so nothing will be quit."
     }
 
     private func requestAccessibilityIfNeeded() {
@@ -411,9 +434,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
 
         if !AXIsProcessTrusted() {
-            let warn = NSMenuItem(title: "Accessibility permission needed", action: #selector(openAccessibilitySettings), keyEquivalent: "")
+            let warn = NSMenuItem(title: "Not authorised: nothing is being quit", action: #selector(openAccessibilitySettings), keyEquivalent: "")
             warn.target = self
             menu.addItem(warn)
+            // After a rebuild the switch often still looks ticked while the
+            // grant is dead, because TCC matches the old code signature. Ticking
+            // it off and on again does not fix that; the entry has to be removed.
+            menu.addItem(caption("If QuitOnClose already looks ticked there, remove it with the minus button, then add it again."))
             menu.addItem(.separator())
         }
 
@@ -552,6 +579,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+// MARK: - Permission check
+
+private let permCheckURL = URL(fileURLWithPath: NSHomeDirectory())
+    .appendingPathComponent("Library/Logs/QuitOnClose-permcheck.log")
+
+enum GUIPermissionState {
+    case trusted
+    case untrusted
+    case unknown(String)
+}
+
+/// Answers "is the app the user actually launches authorised?".
+///
+/// TCC judges the *responsible* process, so a copy of this binary started from a
+/// shell is judged as the terminal. The only honest answer comes from a copy
+/// launched through Launch Services, which is what `--permcheck` is for: it
+/// writes its verdict to a file, because a `open -a` launch has no stdout.
+func runPermCheck() -> Never {
+    let trusted = AXIsProcessTrusted()
+    try? "\(trusted)\n".write(to: permCheckURL, atomically: true, encoding: .utf8)
+    print("AXIsProcessTrusted=\(trusted)")
+    exit(trusted ? 0 : 1)
+}
+
+func guiPermissionState() -> GUIPermissionState {
+    try? FileManager.default.removeItem(at: permCheckURL)
+
+    let bundlePath = Bundle.main.bundlePath
+    guard bundlePath.hasSuffix(".app") else { return .unknown("not running from an app bundle") }
+
+    let open = Process()
+    open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    open.arguments = ["-n", "-g", "-a", bundlePath, "--args", "--permcheck"]
+    do { try open.run() } catch { return .unknown("could not launch a copy: \(error.localizedDescription)") }
+    open.waitUntilExit()
+
+    let deadline = Date().addingTimeInterval(10)
+    while Date() < deadline {
+        if let text = try? String(contentsOf: permCheckURL, encoding: .utf8) {
+            return text.trimmingCharacters(in: .whitespacesAndNewlines) == "true" ? .trusted : .untrusted
+        }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+    }
+    return .unknown("the app-side check did not answer within 10s")
+}
+
 // MARK: - Self test
 
 /// End-to-end proof that the real Monitor quits a real app when its last window
@@ -585,6 +658,25 @@ func runSelfTest() -> Never {
 
     try? FileManager.default.removeItem(at: logURL)
     say("--- selftest start, AXIsProcessTrusted=\(AXIsProcessTrusted())")
+
+    // A run started from a shell is attributed by TCC to the terminal, so it
+    // borrows the terminal's Accessibility grant and reports trusted even when
+    // the menu bar app has none. That made this test pass while the real app
+    // quit nothing for days (2026-08-14, Acrobat). Ask the app itself, launched
+    // the way the user launches it, and believe that answer instead.
+    // Asked unconditionally: a tty check cannot tell a shell run from a piped
+    // one, and the answer that matters is always the app's own.
+    do {
+        say("checking the app's own Accessibility grant, not this process's ...")
+        switch guiPermissionState() {
+        case .trusted:
+            say("app-side Accessibility: granted")
+        case .untrusted:
+            fail("the app itself has no Accessibility permission, so it quits nothing, even though this terminal run reports trusted. Open System Settings > Privacy & Security > Accessibility; if QuitOnClose is listed, remove it with the minus button and add it again, because a rebuild leaves a stale entry that still looks ticked.")
+        case .unknown(let why):
+            say("warning: could not ask the app itself (\(why)); this run only proves the logic, not the permission.")
+        }
+    }
 
     guard AXIsProcessTrusted() else {
         fail("no Accessibility permission. Enable QuitOnClose in System Settings > Privacy & Security > Accessibility, then rerun.")
@@ -776,6 +868,10 @@ func runMenuTest() -> Never {
     }
     print("FAILED: \(failures.count) — \(failures.joined(separator: "; "))")
     exit(1)
+}
+
+if CommandLine.arguments.contains("--permcheck") {
+    runPermCheck()
 }
 
 if CommandLine.arguments.contains("--menutest") {
