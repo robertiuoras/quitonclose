@@ -162,6 +162,17 @@ final class Store {
 
 }
 
+// MARK: - Debug
+
+/// Set QOC_DEBUG=1 to trace every polling decision. Off by default: the poll
+/// runs twice a second against every ticked app.
+let debugEnabled = ProcessInfo.processInfo.environment["QOC_DEBUG"] == "1"
+
+func debugLog(_ message: String) {
+    guard debugEnabled else { return }
+    FileHandle.standardError.write(Data("[qoc] \(message)\n".utf8))
+}
+
 // MARK: - Monitor
 
 /// Polls the Accessibility window list of every enabled app and terminates an
@@ -230,7 +241,11 @@ final class Monitor {
 
             // A nil count means the app did not answer in time. Treat that as
             // "unknown", never as "no windows".
-            guard let count = windowCount(pid) else { continue }
+            guard let count = windowCount(pid) else {
+                debugLog("\(bundleID): no answer from the Accessibility query, poll ignored")
+                continue
+            }
+            debugLog("\(bundleID): windows=\(count) seenWindow=\(hadWindows.contains(pid))")
 
             if count > 0 {
                 hadWindows.insert(pid)
@@ -245,6 +260,7 @@ final class Monitor {
 
             let streak = (zeroPolls[pid] ?? 0) + 1
             zeroPolls[pid] = streak
+            debugLog("\(bundleID): zero-window poll \(streak)/\(zeroPollsBeforeQuit)")
             if streak >= zeroPollsBeforeQuit {
                 zeroPolls[pid] = 0
                 hadWindows.remove(pid)
