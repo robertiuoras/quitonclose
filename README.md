@@ -6,7 +6,21 @@ A tiny macOS menu-bar utility that quits an app the moment you close its last wi
 
 It is a drop-in replacement for the paid FixRed ($4.99): per-app opt-in, launch at login, native universal binary (Apple Silicon + Intel), macOS 13 Ventura or later.
 
-## Install
+[![Latest release](https://img.shields.io/github/v/release/robertiuoras/quitonclose?style=flat-square&color=F05138&label=release)](https://github.com/robertiuoras/quitonclose/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/robertiuoras/quitonclose/total?style=flat-square&color=475569&label=downloads)](https://github.com/robertiuoras/quitonclose/releases)
+[![Platform](https://img.shields.io/badge/macOS%2013%2B-universal-475569?style=flat-square)](https://github.com/robertiuoras/quitonclose/releases/latest)
+[![License](https://img.shields.io/github/license/robertiuoras/quitonclose?style=flat-square&color=475569)](LICENSE)
+
+
+## Download
+
+[**⬇ Download QuitOnClose.zip**](https://github.com/robertiuoras/quitonclose/releases/latest) — unzip, drag `QuitOnClose.app` into `/Applications`, open it.
+
+macOS will say the app is from an unidentified developer the first time: right-click it in `/Applications` and choose **Open**, then **Open** again. That is a one-time step for any app that is not notarized by a paid Apple developer account.
+
+Then grant one permission: **System Settings › Privacy & Security › Accessibility** and switch **QuitOnClose** on. Without it the app cannot see window counts and will never quit anything.
+
+## Build it yourself
 
 ```bash
 git clone https://github.com/robertiuoras/quitonclose.git
@@ -15,8 +29,6 @@ cd quitonclose
 ```
 
 That builds `QuitOnClose.app`, ad-hoc signs it, copies it to `/Applications` and launches it. `./build.sh` on its own builds into `build/` without installing.
-
-Then grant one permission: **System Settings > Privacy & Security > Accessibility** and switch **QuitOnClose** on. The app cannot see window counts without it, and without it, it never quits anything.
 
 ## Use
 
