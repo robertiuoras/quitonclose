@@ -19,6 +19,12 @@ private let windowlessSecondsToRecommend: Double = 15
 private let zeroPollsBeforeQuit = 2
 /// Never quit an app within this many seconds of launch.
 private let launchGrace: TimeInterval = 3
+/// An app that is still burning this much CPU (itself plus its helper
+/// processes) with no window open is still finishing something — a reply
+/// streaming in, an upload, an export, a save. Quitting it there is the one
+/// case where "quit on close" destroys work, so the quit waits until the app
+/// goes quiet. Idle ChatGPT and Claude both measured under 1% of one core.
+private let busyCPUPercent: Double = 8
 
 private let neverQuit: Set<String> = [
     "com.apple.finder",
@@ -173,6 +179,116 @@ func debugLog(_ message: String) {
     FileHandle.standardError.write(Data("[qoc] \(message)\n".utf8))
 }
 
+// MARK: - Window scan and the quit decision
+
+/// One poll's view of an app's windows.
+///
+/// Dialogs are counted apart from real windows on purpose. An app that answers
+/// a quit request with "are you sure?" (ChatGPT and Claude both do, and so does
+/// any app with unsaved work) puts a dialog on screen while it has no real
+/// window. Counting that dialog as a window made QuitOnClose treat the app as
+/// re-opened, so the moment the human pressed "No" the window count fell back
+/// to zero and the app was asked to quit again — the prompt reappeared forever.
+struct WindowScan: Equatable {
+    let real: Int
+    let dialogs: Int
+}
+
+/// Subroles that mean "this window is asking the human something", not "the
+/// human reopened the app".
+private let dialogSubroles: Set<String> = [
+    kAXDialogSubrole as String,
+    kAXSystemDialogSubrole as String,
+    kAXFloatingWindowSubrole as String,
+]
+
+/// What one poll decided about one enabled app.
+enum QuitDecision: Equatable {
+    /// Real window on screen: nothing to do, and the app is armed again.
+    case hasWindows
+    /// The app is asking the human something. Never quit over a dialog, and
+    /// never let a dialog re-arm the quit.
+    case dialogOpen
+    /// Never showed a window under our watch, so it is background-only.
+    case neverShowedWindow
+    /// Still working with no window. Wait for it to go quiet.
+    case busy(Double)
+    /// Already asked once and it did not go. Asking again is the pop-up loop.
+    case alreadyAsked
+    /// Windowless, but not for long enough yet.
+    case waitForStreak
+    case quit
+}
+
+/// Pure so it can be tested without a running app. Order matters: a dialog
+/// outranks everything, and "already asked" outranks the streak, so a refused
+/// quit is never retried until a real window comes back.
+func quitDecision(scan: WindowScan,
+                  hadRealWindow: Bool,
+                  askedAlready: Bool,
+                  streak: Int,
+                  cpuPercent: Double?) -> QuitDecision {
+    if scan.real > 0 { return .hasWindows }
+    if scan.dialogs > 0 { return .dialogOpen }
+    if askedAlready { return .alreadyAsked }
+    if !hadRealWindow { return .neverShowedWindow }
+    if let cpu = cpuPercent, cpu > busyCPUPercent { return .busy(cpu) }
+    if streak < zeroPollsBeforeQuit { return .waitForStreak }
+    return .quit
+}
+
+/// Total CPU seconds one process has ever used, or nil if it cannot be read
+/// (already gone, or another user's process).
+func cpuSecondsUsed(_ pid: pid_t) -> Double? {
+    var usage = rusage_info_current()
+    let ok = withUnsafeMutablePointer(to: &usage) { pointer in
+        pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rebound in
+            proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, rebound)
+        }
+    }
+    guard ok == 0 else { return nil }
+    return Double(usage.ri_user_time + usage.ri_system_time) / 1_000_000_000
+}
+
+/// Every process descended from `root`, `root` included.
+///
+/// Needed because the apps this matters for are Electron: ChatGPT's own
+/// process sat at 0.3% while its renderer and `codex` helper children did the
+/// work (measured 2026-08-20, 19 child processes under pid 33753). Reading only
+/// the app's own pid would call a busy app idle and quit it mid-answer.
+func processTree(_ root: pid_t, maxDepth: Int = 6) -> [pid_t] {
+    var buffer = [pid_t](repeating: 0, count: 4096)
+    let bytes = proc_listallpids(&buffer, Int32(MemoryLayout<pid_t>.size * buffer.count))
+    guard bytes > 0 else { return [root] }
+    let all = buffer.prefix(Int(bytes) / MemoryLayout<pid_t>.size).filter { $0 > 0 }
+
+    var children = [pid_t: [pid_t]]()
+    for pid in all {
+        var info = proc_bsdshortinfo()
+        let size = Int32(MemoryLayout<proc_bsdshortinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDT_SHORTBSDINFO, 0, &info, size) == size else { continue }
+        children[pid_t(info.pbsi_ppid), default: []].append(pid)
+    }
+
+    var tree = [root]
+    var frontier = [root]
+    var seen: Set<pid_t> = [root]
+    for _ in 0..<maxDepth {
+        let next = frontier.flatMap { children[$0] ?? [] }.filter { seen.insert($0).inserted }
+        if next.isEmpty { break }
+        tree += next
+        frontier = next
+    }
+    return tree
+}
+
+/// CPU seconds used by an app and all of its helper processes.
+func treeCPUSecondsUsed(_ root: pid_t) -> Double? {
+    let seconds = processTree(root).compactMap(cpuSecondsUsed)
+    guard !seconds.isEmpty else { return nil }
+    return seconds.reduce(0, +)
+}
+
 // MARK: - Monitor
 
 /// Polls the Accessibility window list of every enabled app and terminates an
@@ -187,6 +303,12 @@ final class Monitor {
     private var hadWindows = Set<pid_t>()
     private var zeroPolls = [pid_t: Int]()
     private var firstSeen = [pid_t: Date]()
+    /// Apps already asked to quit once that are still here. Cleared only when a
+    /// real window comes back, so a "No" on the app's own confirmation dialog
+    /// ends the matter instead of starting the next ask.
+    private var askedQuit = Set<pid_t>()
+    /// pid -> (total CPU seconds, when it was read), for the busy check.
+    private var cpuSamples = [pid_t: (seconds: Double, at: Date)]()
 
     func start() {
         timer?.invalidate()
@@ -239,41 +361,61 @@ final class Monitor {
             live.insert(pid)
             if firstSeen[pid] == nil { firstSeen[pid] = app.launchDate ?? Date() }
 
-            // A nil count means the app did not answer in time. Treat that as
+            // A nil scan means the app did not answer in time. Treat that as
             // "unknown", never as "no windows".
-            guard let count = windowCount(pid) else {
+            guard let scan = scanWindows(pid) else {
                 debugLog("\(bundleID): no answer from the Accessibility query, poll ignored")
                 continue
             }
-            debugLog("\(bundleID): windows=\(count) seenWindow=\(hadWindows.contains(pid))")
+            // Only sampled while the app is windowless: that is the only moment
+            // it can matter, and walking the process table twice a second for
+            // every ticked app would not be free.
+            let cpu = scan.real == 0 && scan.dialogs == 0 ? cpuPercent(pid) : nil
 
-            if count > 0 {
-                hadWindows.insert(pid)
+            if scan.real == 0 && scan.dialogs == 0 && hadWindows.contains(pid) {
+                zeroPolls[pid] = (zeroPolls[pid] ?? 0) + 1
+            } else if scan.real > 0 {
                 zeroPolls[pid] = 0
-                continue
             }
 
-            // Only quit apps that have actually shown a window under our watch,
-            // so a freshly launched or background-only app is left alone.
-            guard hadWindows.contains(pid) else { continue }
             guard Date().timeIntervalSince(firstSeen[pid] ?? .distantPast) > launchGrace else { continue }
 
-            let streak = (zeroPolls[pid] ?? 0) + 1
-            zeroPolls[pid] = streak
-            debugLog("\(bundleID): zero-window poll \(streak)/\(zeroPollsBeforeQuit)")
-            if streak >= zeroPollsBeforeQuit {
+            let decision = quitDecision(scan: scan,
+                                        hadRealWindow: hadWindows.contains(pid),
+                                        askedAlready: askedQuit.contains(pid),
+                                        streak: zeroPolls[pid] ?? 0,
+                                        cpuPercent: cpu)
+            debugLog("\(bundleID): real=\(scan.real) dialogs=\(scan.dialogs) "
+                     + "cpu=\(cpu.map { String(format: "%.1f%%", $0) } ?? "?") "
+                     + "streak=\(zeroPolls[pid] ?? 0) -> \(decision)")
+
+            switch decision {
+            case .hasWindows:
+                hadWindows.insert(pid)
+                // A real window is a fresh chance: whatever happened to the
+                // last quit request, the app is being used again.
+                askedQuit.remove(pid)
+            case .quit:
                 zeroPolls[pid] = 0
                 hadWindows.remove(pid)
+                askedQuit.insert(pid)
                 app.terminate()  // graceful: an app with unsaved work still gets to ask
+            case .dialogOpen, .neverShowedWindow, .busy, .alreadyAsked, .waitForStreak:
+                break
             }
         }
 
         hadWindows.formIntersection(live)
         zeroPolls = zeroPolls.filter { live.contains($0.key) }
         firstSeen = firstSeen.filter { live.contains($0.key) }
+        askedQuit.formIntersection(live)
+        cpuSamples = cpuSamples.filter { live.contains($0.key) }
     }
 
-    func windowCount(_ pid: pid_t) -> Int? {
+    /// Real windows only, for the survey and the self test.
+    func windowCount(_ pid: pid_t) -> Int? { scanWindows(pid)?.real }
+
+    func scanWindows(_ pid: pid_t) -> WindowScan? {
         let axApp = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(axApp, 0.3)
 
@@ -281,13 +423,34 @@ final class Monitor {
         let err = AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &value)
         guard err == .success, let windows = value as? [AXUIElement] else { return nil }
 
-        return windows.filter { window in
+        var real = 0
+        var dialogs = 0
+        for window in windows {
             var roleRef: CFTypeRef?
             guard AXUIElementCopyAttributeValue(window, kAXRoleAttribute as CFString, &roleRef) == .success,
-                  let role = roleRef as? String
-            else { return false }
-            return role == (kAXWindowRole as String)
-        }.count
+                  let role = roleRef as? String, role == (kAXWindowRole as String)
+            else { continue }
+
+            var subroleRef: CFTypeRef?
+            let subrole = AXUIElementCopyAttributeValue(window, kAXSubroleAttribute as CFString, &subroleRef) == .success
+                ? (subroleRef as? String) : nil
+            if let subrole, dialogSubroles.contains(subrole) { dialogs += 1 } else { real += 1 }
+        }
+        return WindowScan(real: real, dialogs: dialogs)
+    }
+
+    /// CPU use since the previous poll, as a percentage of one core. Nil on the
+    /// first poll for a pid (no baseline yet) or if the process cannot be read.
+    func cpuPercent(_ pid: pid_t) -> Double? {
+        guard let now = treeCPUSecondsUsed(pid) else { return nil }
+        let at = Date()
+        defer { cpuSamples[pid] = (now, at) }
+        guard let previous = cpuSamples[pid] else { return nil }
+        let elapsed = at.timeIntervalSince(previous.at)
+        // A clock jump (sleep/wake) or a rewound counter reads as "unknown",
+        // never as "idle": an unknown must not authorise a quit.
+        guard elapsed > 0.05, now >= previous.seconds else { return nil }
+        return (now - previous.seconds) / elapsed * 100
     }
 }
 
@@ -762,6 +925,181 @@ func runSelfTest() -> Never {
     exit(0)
 }
 
+// MARK: - Dialog test
+
+/// The source of a throwaway app that behaves like ChatGPT and Claude do: it
+/// answers a quit request with a confirmation dialog and stays running.
+private let victimSource = """
+import Cocoa
+
+final class VictimDelegate: NSObject, NSApplicationDelegate {
+    var window: NSWindow?
+    var alert: NSAlert?
+
+    func applicationDidFinishLaunching(_ note: Notification) {
+        let w = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 320, height: 160),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = "QuitOnClose dialog victim"
+        w.makeKeyAndOrderFront(nil)
+        window = w
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Non-blocking on purpose: a runModal would freeze this process's run
+        // loop and the test could not press the button back.
+        let a = NSAlert()
+        a.messageText = "Are you sure you want to quit?"
+        a.addButton(withTitle: "Cancel")
+        a.window.makeKeyAndOrderFront(nil)
+        alert = a
+        return .terminateCancel
+    }
+}
+
+let app = NSApplication.shared
+let delegate = VictimDelegate()
+app.delegate = delegate
+app.setActivationPolicy(.regular)
+app.run()
+"""
+
+/// Proves the pop-up loop is gone, against a real app that really refuses.
+///
+/// Before this fix the confirmation dialog counted as a window, so dismissing
+/// it re-armed the quit and the dialog came straight back — the bug Robert hit
+/// with ChatGPT and Claude (2026-08-20).
+///
+/// Run:  /Applications/QuitOnClose.app/Contents/MacOS/QuitOnClose --dialogtest
+func runDialogTest() -> Never {
+    func say(_ message: String) { print(message) }
+    func fail(_ message: String) -> Never { say("FAIL: \(message)"); exit(1) }
+
+    guard AXIsProcessTrusted() else {
+        fail("no Accessibility permission for this process, so nothing can be observed")
+    }
+
+    let bundleID = "com.quitonclose.test.victim"
+    let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("qoc-dialogtest")
+    let appURL = root.appendingPathComponent("Victim.app")
+    let macOS = appURL.appendingPathComponent("Contents/MacOS")
+    try? FileManager.default.removeItem(at: root)
+    try? FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
+
+    let sourceURL = root.appendingPathComponent("victim.swift")
+    try? victimSource.write(to: sourceURL, atomically: true, encoding: .utf8)
+    let plist = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>
+      <key>CFBundleExecutable</key><string>Victim</string>
+      <key>CFBundleIdentifier</key><string>\(bundleID)</string>
+      <key>CFBundleName</key><string>Victim</string>
+      <key>CFBundlePackageType</key><string>APPL</string>
+    </dict></plist>
+    """
+    try? plist.write(to: appURL.appendingPathComponent("Contents/Info.plist"),
+                     atomically: true, encoding: .utf8)
+
+    say("1. building the victim app ...")
+    let compile = Process()
+    compile.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    compile.arguments = ["swiftc", "-O", sourceURL.path, "-framework", "Cocoa",
+                         "-o", macOS.appendingPathComponent("Victim").path]
+    try? compile.run()
+    compile.waitUntilExit()
+    guard compile.terminationStatus == 0 else { fail("could not compile the victim app (swiftc missing?)") }
+
+    let monitor = Monitor()
+    Store.shared.enableEphemeral(bundleID)
+    monitor.start()
+
+    func victim() -> NSRunningApplication? {
+        NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == bundleID && !$0.isTerminated }
+    }
+    func wait(seconds: TimeInterval, for check: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if check() { return true }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        }
+        return check()
+    }
+
+    say("2. launching it ...")
+    let config = NSWorkspace.OpenConfiguration()
+    config.activates = false
+    var launchError: Error?
+    NSWorkspace.shared.openApplication(at: appURL, configuration: config) { _, error in launchError = error }
+    guard wait(seconds: 20, for: { (victim()?.processIdentifier).flatMap { (monitor.scanWindows($0)?.real ?? 0) > 0 } ?? false })
+    else { fail("the victim never showed a window (\(launchError.map { "\($0)" } ?? "no launch error"))") }
+    guard let app = victim() else { fail("the victim vanished") }
+    let pid = app.processIdentifier
+    say("   victim pid \(pid), windows=\(monitor.scanWindows(pid)!)")
+
+    _ = wait(seconds: launchGrace + 1) { false }
+
+    say("3. closing its only window ...")
+    let axApp = AXUIElementCreateApplication(pid)
+    var windowsRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+          let windows = windowsRef as? [AXUIElement], let window = windows.first
+    else { fail("could not read the victim's windows") }
+    var closeRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &closeRef) == .success,
+          let closeButton = closeRef, CFGetTypeID(closeButton) == AXUIElementGetTypeID(),
+          AXUIElementPerformAction(closeButton as! AXUIElement, kAXPressAction as CFString) == .success
+    else { fail("could not press the window's close button") }
+
+    say("4. waiting for QuitOnClose to ask it to quit, and for it to refuse ...")
+    guard wait(seconds: 15, for: { (monitor.scanWindows(pid)?.dialogs ?? 0) > 0 }) else {
+        if victim() == nil { fail("the victim was killed outright; its refusal was never seen") }
+        fail("the victim was never asked to quit within 15s")
+    }
+    guard let asked = monitor.scanWindows(pid) else { fail("lost sight of the victim") }
+    say("   confirmation dialog is up: real=\(asked.real) dialogs=\(asked.dialogs)")
+    guard asked.real == 0 else { fail("the confirmation dialog is being counted as a real window (real=\(asked.real))") }
+
+    say("5. pressing Cancel, the way a human answers 'no' ...")
+    var afterRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &afterRef) == .success,
+          let live = afterRef as? [AXUIElement] else { fail("could not re-read the victim's windows") }
+    var pressed = false
+    for dialog in live {
+        var kidsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(dialog, kAXChildrenAttribute as CFString, &kidsRef) == .success,
+              let kids = kidsRef as? [AXUIElement] else { continue }
+        for kid in kids {
+            var titleRef: CFTypeRef?
+            _ = AXUIElementCopyAttributeValue(kid, kAXTitleAttribute as CFString, &titleRef)
+            if (titleRef as? String) == "Cancel",
+               AXUIElementPerformAction(kid, kAXPressAction as CFString) == .success {
+                pressed = true
+                break
+            }
+        }
+        if pressed { break }
+    }
+    guard pressed else { fail("could not find the Cancel button in the confirmation dialog") }
+
+    say("6. watching for 15s that it is not asked again ...")
+    var reasks = 0
+    let deadline = Date().addingTimeInterval(15)
+    while Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        if (monitor.scanWindows(pid)?.dialogs ?? 0) > 0 { reasks += 1 }
+        if victim() == nil { break }
+    }
+
+    let survived = victim() != nil
+    victim()?.forceTerminate()
+    try? FileManager.default.removeItem(at: root)
+
+    if reasks > 0 { fail("the confirmation dialog came back \(reasks) polls after the human said no") }
+    guard survived else { fail("the victim was terminated even though it refused the quit") }
+    say("PASS: asked once, refused once, never asked again; the victim is still running")
+    exit(0)
+}
+
 // MARK: - Menu test
 
 /// Proves the two menu promises without a human clicking anything:
@@ -811,6 +1149,39 @@ func runMenuTest() -> Never {
           "the observation total is capped, so it cannot grow forever")
     // Evidence for a made-up app must not linger in the real defaults.
     Store.shared.forgetWindowless(fake)
+
+    // --- the quit decision -------------------------------------------------
+    let windowed = WindowScan(real: 1, dialogs: 0)
+    let bare = WindowScan(real: 0, dialogs: 0)
+    let asking = WindowScan(real: 0, dialogs: 1)
+
+    check(quitDecision(scan: bare, hadRealWindow: true, askedAlready: false,
+                       streak: zeroPollsBeforeQuit, cpuPercent: 0) == .quit,
+          "an idle app that showed a window and then closed it is quit")
+    check(quitDecision(scan: bare, hadRealWindow: true, askedAlready: false,
+                       streak: 1, cpuPercent: 0) == .waitForStreak,
+          "one zero-window poll is not enough")
+    check(quitDecision(scan: asking, hadRealWindow: true, askedAlready: false,
+                       streak: 99, cpuPercent: 0) == .dialogOpen,
+          "an app showing a dialog is never quit")
+    check(quitDecision(scan: asking, hadRealWindow: false, askedAlready: true,
+                       streak: 99, cpuPercent: 0) == .dialogOpen,
+          "the app's own 'are you sure?' does not count as a reopened window")
+    check(quitDecision(scan: bare, hadRealWindow: true, askedAlready: true,
+                       streak: 99, cpuPercent: 0) == .alreadyAsked,
+          "an app that was already asked once is never asked again")
+    check(quitDecision(scan: bare, hadRealWindow: true, askedAlready: false,
+                       streak: 99, cpuPercent: busyCPUPercent + 10) == .busy(busyCPUPercent + 10),
+          "an app still working with no window is left alone")
+    check(quitDecision(scan: bare, hadRealWindow: true, askedAlready: false,
+                       streak: 99, cpuPercent: nil) == .quit,
+          "an unreadable CPU figure does not block the quit forever")
+    check(quitDecision(scan: windowed, hadRealWindow: false, askedAlready: true,
+                       streak: 99, cpuPercent: 0) == .hasWindows,
+          "a real window re-arms an app that refused an earlier quit")
+    check(quitDecision(scan: bare, hadRealWindow: false, askedAlready: false,
+                       streak: 99, cpuPercent: 0) == .neverShowedWindow,
+          "an app that never showed a window is left alone")
 
     // --- the menu itself ---------------------------------------------------
     let application = NSApplication.shared
@@ -879,7 +1250,7 @@ func runMenuTest() -> Never {
     Store.shared.setEnabled(rowID, false)
 
     if failures.isEmpty {
-        print("PASS: 4 menu checks and 5 advice checks")
+        print("PASS: 4 menu checks, 5 advice checks and 9 quit-decision checks")
         exit(0)
     }
     print("FAILED: \(failures.count) — \(failures.joined(separator: "; "))")
@@ -888,6 +1259,10 @@ func runMenuTest() -> Never {
 
 if CommandLine.arguments.contains("--permcheck") {
     runPermCheck()
+}
+
+if CommandLine.arguments.contains("--dialogtest") {
+    runDialogTest()
 }
 
 if CommandLine.arguments.contains("--menutest") {
