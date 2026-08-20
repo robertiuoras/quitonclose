@@ -957,6 +957,89 @@ func runCPUTest() -> Never {
     exit(0)
 }
 
+// MARK: - Real app observation
+
+/// Watches what QuitOnClose really does to one installed app: launch it, close
+/// its last window, then log every poll for 40s. Nothing is asserted about apps
+/// this session does not control; it prints the evidence.
+///
+/// Run:  /Applications/QuitOnClose.app/Contents/MacOS/QuitOnClose --realtest com.anthropic.claudefordesktop
+func runRealTest(_ bundleID: String) -> Never {
+    guard AXIsProcessTrusted() else { print("FAIL: no Accessibility permission"); exit(1) }
+    guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+        print("FAIL: \(bundleID) is not installed"); exit(1)
+    }
+    func running() -> NSRunningApplication? {
+        NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == bundleID && !$0.isTerminated }
+    }
+    if running() != nil {
+        print("FAIL: \(bundleID) is already running; this test only drives an app it launched itself")
+        exit(1)
+    }
+
+    let monitor = Monitor()
+    Store.shared.enableEphemeral(bundleID)
+    monitor.start()
+
+    func wait(seconds: TimeInterval, for check: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if check() { return true }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        }
+        return check()
+    }
+
+    print("1. launching \(bundleID) ...")
+    let config = NSWorkspace.OpenConfiguration()
+    config.activates = false
+    NSWorkspace.shared.openApplication(at: appURL, configuration: config) { _, _ in }
+    guard wait(seconds: 30, for: { (running()?.processIdentifier).flatMap { (monitor.scanWindows($0)?.real ?? 0) > 0 } ?? false }),
+          let app = running()
+    else { print("FAIL: it never showed a window"); exit(1) }
+    let pid = app.processIdentifier
+    print("   pid \(pid), \(processTree(pid).count) processes, windows=\(monitor.scanWindows(pid)!)")
+
+    _ = wait(seconds: launchGrace + 1) { false }
+
+    print("2. closing its last window ...")
+    let axApp = AXUIElementCreateApplication(pid)
+    var windowsRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+          let windows = windowsRef as? [AXUIElement], let window = windows.first
+    else { print("FAIL: could not read its windows"); exit(1) }
+    var closeRef: CFTypeRef?
+    if AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &closeRef) == .success,
+       let closeButton = closeRef, CFGetTypeID(closeButton) == AXUIElementGetTypeID() {
+        _ = AXUIElementPerformAction(closeButton as! AXUIElement, kAXPressAction as CFString)
+    } else {
+        print("FAIL: its window has no close button"); exit(1)
+    }
+
+    print("3. watching for 40s ...")
+    var dialogEpisodes = 0
+    var dialogUp = false
+    let deadline = Date().addingTimeInterval(40)
+    while Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        guard running() != nil, let scan = monitor.scanWindows(pid) else { break }
+        if scan.dialogs > 0 && !dialogUp { dialogEpisodes += 1; print("   a dialog appeared (\(scan))") }
+        dialogUp = scan.dialogs > 0
+    }
+
+    if running() == nil {
+        print("RESULT: it quit cleanly, \(dialogEpisodes) confirmation dialog(s) seen")
+    } else {
+        print("RESULT: still running after 40s, \(dialogEpisodes) confirmation dialog(s) seen")
+    }
+    if dialogEpisodes > 1 {
+        print("FAIL: the confirmation dialog came back \(dialogEpisodes) times")
+        exit(1)
+    }
+    print("PASS: at most one confirmation dialog")
+    exit(0)
+}
+
 // MARK: - Dialog test
 
 /// The source of a throwaway app that behaves like ChatGPT and Claude do: it
@@ -977,6 +1060,16 @@ final class VictimDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Every quit request is recorded, so the test counts asks rather than
+        // inferring them from what is on screen. Counting is the assertion the
+        // bug was about: it was asked again and again.
+        if let path = ProcessInfo.processInfo.environment["QOC_VICTIM_LOG"] {
+            let handle = FileHandle(forWritingAtPath: path)
+            handle?.seekToEndOfFile()
+            handle?.write(Data("ask\\n".utf8))
+            try? handle?.close()
+        }
+
         // Non-blocking on purpose: a runModal would freeze this process's run
         // loop and the test could not press the button back.
         let a = NSAlert()
@@ -1067,8 +1160,16 @@ func runDialogTest() -> Never {
     }
 
     say("2. launching it ...")
+    let logURL = root.appendingPathComponent("asks.log")
+    FileManager.default.createFile(atPath: logURL.path, contents: Data())
+    func askCount() -> Int {
+        ((try? String(contentsOf: logURL, encoding: .utf8)) ?? "")
+            .split(separator: "\n").count
+    }
+
     let config = NSWorkspace.OpenConfiguration()
     config.activates = false
+    config.environment = ["QOC_VICTIM_LOG": logURL.path]
     var launchError: Error?
     NSWorkspace.shared.openApplication(at: appURL, configuration: config) { _, error in launchError = error }
     guard wait(seconds: 20, for: { (victim()?.processIdentifier).flatMap { (monitor.scanWindows($0)?.real ?? 0) > 0 } ?? false })
@@ -1092,12 +1193,12 @@ func runDialogTest() -> Never {
     else { fail("could not press the window's close button") }
 
     say("4. waiting for QuitOnClose to ask it to quit, and for it to refuse ...")
-    guard wait(seconds: 15, for: { (monitor.scanWindows(pid)?.dialogs ?? 0) > 0 }) else {
+    guard wait(seconds: 15, for: { askCount() > 0 }) else {
         if victim() == nil { fail("the victim was killed outright; its refusal was never seen") }
         fail("the victim was never asked to quit within 15s")
     }
     guard let asked = monitor.scanWindows(pid) else { fail("lost sight of the victim") }
-    say("   confirmation dialog is up: real=\(asked.real) dialogs=\(asked.dialogs)")
+    say("   asked \(askCount())x; its dialog reads real=\(asked.real) dialogs=\(asked.dialogs)")
     guard asked.real == 0 else { fail("the confirmation dialog is being counted as a real window (real=\(asked.real))") }
 
     say("5. pressing Cancel, the way a human answers 'no' ...")
@@ -1123,19 +1224,18 @@ func runDialogTest() -> Never {
     guard pressed else { fail("could not find the Cancel button in the confirmation dialog") }
 
     say("6. watching for 15s that it is not asked again ...")
-    var reasks = 0
     let deadline = Date().addingTimeInterval(15)
     while Date() < deadline {
         RunLoop.current.run(until: Date().addingTimeInterval(0.25))
-        if (monitor.scanWindows(pid)?.dialogs ?? 0) > 0 { reasks += 1 }
         if victim() == nil { break }
     }
+    let asks = askCount()
 
     let survived = victim() != nil
     victim()?.forceTerminate()
     try? FileManager.default.removeItem(at: root)
 
-    if reasks > 0 { fail("the confirmation dialog came back \(reasks) polls after the human said no") }
+    if asks != 1 { fail("the app was asked to quit \(asks) times; the human answered no after the first") }
     guard survived else { fail("the victim was terminated even though it refused the quit") }
     say("PASS: asked once, refused once, never asked again; the victim is still running")
     exit(0)
@@ -1300,6 +1400,11 @@ func runMenuTest() -> Never {
 
 if CommandLine.arguments.contains("--permcheck") {
     runPermCheck()
+}
+
+if let index = CommandLine.arguments.firstIndex(of: "--realtest") {
+    runRealTest(CommandLine.arguments.count > index + 1
+                ? CommandLine.arguments[index + 1] : "com.anthropic.claudefordesktop")
 }
 
 if CommandLine.arguments.contains("--cputest") {
