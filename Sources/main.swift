@@ -1022,7 +1022,11 @@ func runRealTest(_ bundleID: String) -> Never {
     let deadline = Date().addingTimeInterval(40)
     while Date() < deadline {
         RunLoop.current.run(until: Date().addingTimeInterval(0.25))
-        guard running() != nil, let scan = monitor.scanWindows(pid) else { break }
+        if running() == nil { break }
+        // An unanswered Accessibility query means the app is busy or on its way
+        // out, never "no dialog": breaking here reported a quitting app as
+        // still running, which is exactly the lie this observer exists to catch.
+        guard let scan = monitor.scanWindows(pid) else { continue }
         if scan.dialogs > 0 && !dialogUp { dialogEpisodes += 1; print("   a dialog appeared (\(scan))") }
         dialogUp = scan.dialogs > 0
     }

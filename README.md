@@ -20,6 +20,25 @@ macOS will say the app is from an unidentified developer the first time: right-c
 
 Then grant one permission: **System Settings › Privacy & Security › Accessibility** and switch **QuitOnClose** on. Without it the app cannot see window counts and will never quit anything.
 
+## What it will never quit
+
+QuitOnClose asks an app to quit; it never kills one. Three things stop it:
+
+- **An app that is asking you something.** A confirmation dialog ("are you sure you want to quit?", "save changes?") is not counted as a window, so answering *No* ends it. The app is asked once, and not again until you open a real window and close it.
+- **An app that is still working.** With no window open, an app whose processes are still using more than 8% of a core — a reply still streaming in, an upload, an export — is left alone until it goes quiet. Helper processes count: an Electron app like ChatGPT is 19 processes and the work happens in the children, not the app itself.
+- **An app that keeps working by design.** Music, calls, downloads, sync, VPNs and backups are never recommended.
+
+## Tests
+
+```bash
+./build.sh
+./build/QuitOnClose.app/Contents/MacOS/QuitOnClose --menutest    # menu + advice + quit decisions, no permissions needed
+./build/QuitOnClose.app/Contents/MacOS/QuitOnClose --selftest    # quits a real TextEdit window (needs Accessibility)
+./build/QuitOnClose.app/Contents/MacOS/QuitOnClose --dialogtest  # an app that refuses is asked exactly once
+./build/QuitOnClose.app/Contents/MacOS/QuitOnClose --cputest     # what the busy check sees for every running app
+./build/QuitOnClose.app/Contents/MacOS/QuitOnClose --realtest com.anthropic.claudefordesktop  # drive one installed app end to end
+```
+
 ## Build it yourself
 
 ```bash
