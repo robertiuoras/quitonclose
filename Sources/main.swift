@@ -23,7 +23,8 @@ private let launchGrace: TimeInterval = 3
 /// processes) with no window open is still finishing something — a reply
 /// streaming in, an upload, an export, a save. Quitting it there is the one
 /// case where "quit on close" destroys work, so the quit waits until the app
-/// goes quiet. Idle ChatGPT and Claude both measured under 1% of one core.
+/// goes quiet. Measured 2026-08-20: idle ChatGPT is 0.0% across its 19
+/// processes, so a threshold this low still never fires on an idle app.
 private let busyCPUPercent: Double = 8
 
 private let neverQuit: Set<String> = [
@@ -257,10 +258,14 @@ func cpuSecondsUsed(_ pid: pid_t) -> Double? {
 /// work (measured 2026-08-20, 19 child processes under pid 33753). Reading only
 /// the app's own pid would call a busy app idle and quit it mid-answer.
 func processTree(_ root: pid_t, maxDepth: Int = 6) -> [pid_t] {
-    var buffer = [pid_t](repeating: 0, count: 4096)
-    let bytes = proc_listallpids(&buffer, Int32(MemoryLayout<pid_t>.size * buffer.count))
-    guard bytes > 0 else { return [root] }
-    let all = buffer.prefix(Int(bytes) / MemoryLayout<pid_t>.size).filter { $0 > 0 }
+    var buffer = [pid_t](repeating: 0, count: 8192)
+    // proc_listallpids returns the NUMBER OF PIDS, not the number of bytes,
+    // unlike most of the proc_* family. Dividing by sizeof(pid_t) here silently
+    // read only the first quarter of the process table and reported ChatGPT as
+    // a single process with no helpers (measured 2026-08-20: 148 of 593).
+    let count = proc_listallpids(&buffer, Int32(MemoryLayout<pid_t>.size * buffer.count))
+    guard count > 0 else { return [root] }
+    let all = buffer.prefix(min(Int(count), buffer.count)).filter { $0 > 0 }
 
     var children = [pid_t: [pid_t]]()
     for pid in all {
@@ -925,6 +930,33 @@ func runSelfTest() -> Never {
     exit(0)
 }
 
+// MARK: - CPU probe
+
+/// Prints what the busy check sees for every running app: how many processes
+/// the app really is, and what share of one core they are using together.
+///
+/// Run:  /Applications/QuitOnClose.app/Contents/MacOS/QuitOnClose --cputest
+func runCPUTest() -> Never {
+    let apps = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
+    var before = [pid_t: Double]()
+    for app in apps { before[app.processIdentifier] = treeCPUSecondsUsed(app.processIdentifier) }
+    let start = Date()
+    Thread.sleep(forTimeInterval: 2)
+    let elapsed = Date().timeIntervalSince(start)
+
+    print(String(format: "%-28s %6s %8s", ("app" as NSString).utf8String!,
+                 ("procs" as NSString).utf8String!, ("cpu%" as NSString).utf8String!))
+    for app in apps {
+        let pid = app.processIdentifier
+        guard let then = before[pid], let now = treeCPUSecondsUsed(pid) else { continue }
+        let percent = (now - then) / elapsed * 100
+        let name = (app.localizedName ?? "?").padding(toLength: 28, withPad: " ", startingAt: 0)
+        print(String(format: "%@ %6d %8.1f%@", name, processTree(pid).count, percent,
+                     percent > busyCPUPercent ? "   <- treated as busy" : ""))
+    }
+    exit(0)
+}
+
 // MARK: - Dialog test
 
 /// The source of a throwaway app that behaves like ChatGPT and Claude do: it
@@ -950,9 +982,18 @@ final class VictimDelegate: NSObject, NSApplicationDelegate {
         let a = NSAlert()
         a.messageText = "Are you sure you want to quit?"
         a.addButton(withTitle: "Cancel")
+        // Ordered front rather than run modally, so the button needs its own
+        // action: with no modal session running, an NSAlert button does nothing.
+        a.buttons.first?.target = self
+        a.buttons.first?.action = #selector(dismiss)
         a.window.makeKeyAndOrderFront(nil)
         alert = a
         return .terminateCancel
+    }
+
+    @objc func dismiss() {
+        alert?.window.orderOut(nil)
+        alert = nil
     }
 }
 
@@ -1259,6 +1300,10 @@ func runMenuTest() -> Never {
 
 if CommandLine.arguments.contains("--permcheck") {
     runPermCheck()
+}
+
+if CommandLine.arguments.contains("--cputest") {
+    runCPUTest()
 }
 
 if CommandLine.arguments.contains("--dialogtest") {
