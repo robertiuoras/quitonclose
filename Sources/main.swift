@@ -981,6 +981,29 @@ func runSelfTest() -> Never {
         fail("TextEdit is still running 10s after its last window closed")
     }
     say(String(format: "PASS: TextEdit quit %.2fs after its last window closed", Date().timeIntervalSince(start)))
+
+    // The GuardDeck bridge logs on the tick AFTER the quit is confirmed dead, and
+    // `exit(0)` here used to win that race every time — the selftest passed while
+    // never once exercising guardDeckLog(). Keep spinning until the events file
+    // gains an actor:"quitonclose" line, or say plainly that it did not.
+    let events = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".claude/guarddeck/events.jsonl")
+    if FileManager.default.fileExists(atPath: events.deletingLastPathComponent().path) {
+        let baseline = (try? String(contentsOf: events, encoding: .utf8))?
+            .components(separatedBy: "\"actor\":\"quitonclose\"").count ?? 1
+        let logged = wait(seconds: 5) {
+            let now = (try? String(contentsOf: events, encoding: .utf8))?
+                .components(separatedBy: "\"actor\":\"quitonclose\"").count ?? 1
+            return now > baseline
+        }
+        if logged {
+            say("PASS: GuardDeck bridge logged the quit to events.jsonl")
+        } else {
+            fail("quit worked but no actor:\"quitonclose\" line reached ~/.claude/guarddeck/events.jsonl within 5s")
+        }
+    } else {
+        say("GuardDeck not installed on this Mac; bridge not checked.")
+    }
     try? FileManager.default.removeItem(at: scratch)
     exit(0)
 }
