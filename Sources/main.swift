@@ -180,6 +180,38 @@ func debugLog(_ message: String) {
     FileHandle.standardError.write(Data("[qoc] \(message)\n".utf8))
 }
 
+// MARK: - GuardDeck Activity feed
+
+/// Appends a confirmed quit to GuardDeck's events.jsonl so every resource action
+/// on this Mac — guard kills and QuitOnClose quits alike — reads off one Activity
+/// tab. Same contract as guard-gate.mjs logEvent(): history is a nicety, so any
+/// failure (no GuardDeck, unwritable dir) is swallowed and the quit stands.
+func guardDeckLog(title: String, detail: String) {
+    let dir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".claude/guarddeck")
+    let file = dir.appendingPathComponent("events.jsonl")
+    let event: [String: Any] = [
+        "ts": Int64(Date().timeIntervalSince1970 * 1000),
+        "actor": "quitonclose",
+        "decision": "auto",
+        "title": title,
+        "detail": detail,
+    ]
+    guard FileManager.default.fileExists(atPath: dir.path),
+          let json = try? JSONSerialization.data(withJSONObject: event)
+    else { return }
+    var data = json
+    data.append(0x0A)
+    // O_APPEND, not seekToEnd()+write(): those are two syscalls, so a concurrent
+    // writer (guard-gate.mjs appendFileSync, a second instance) could interleave
+    // mid-line. A single O_APPEND write of one small line is atomic — the same
+    // contract every guard already relies on for this file.
+    let fd = open(file.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+    guard fd >= 0 else { return }
+    defer { close(fd) }
+    _ = data.withUnsafeBytes { raw in write(fd, raw.baseAddress, raw.count) }
+}
+
 // MARK: - Window scan and the quit decision
 
 /// One poll's view of an app's windows.
@@ -312,6 +344,12 @@ final class Monitor {
     /// real window comes back, so a "No" on the app's own confirmation dialog
     /// ends the matter instead of starting the next ask.
     private var askedQuit = Set<pid_t>()
+    /// Quit requests awaiting confirmation, so GuardDeck's Activity feed records
+    /// the OUTCOME (the app really exited), never the attempt — an app that puts
+    /// up a save sheet and stays open must not be logged as quit. Entries expire
+    /// after `quitLogWindow` so a much later manual quit is not claimed either.
+    private var pendingQuit = [pid_t: (name: String, at: Date)]()
+    private let quitLogWindow: TimeInterval = 60
     /// pid -> (total CPU seconds, when it was read), for the busy check.
     private var cpuSamples = [pid_t: (seconds: Double, at: Date)]()
 
@@ -400,15 +438,32 @@ final class Monitor {
                 // A real window is a fresh chance: whatever happened to the
                 // last quit request, the app is being used again.
                 askedQuit.remove(pid)
+                pendingQuit.removeValue(forKey: pid)
             case .quit:
                 zeroPolls[pid] = 0
                 hadWindows.remove(pid)
                 askedQuit.insert(pid)
+                pendingQuit[pid] = (app.localizedName ?? bundleID, Date())
                 app.terminate()  // graceful: an app with unsaved work still gets to ask
             case .dialogOpen, .neverShowedWindow, .busy, .alreadyAsked, .waitForStreak:
                 break
             }
         }
+
+        // A pid we asked to quit that is no longer running really did exit —
+        // that is the moment it becomes a fact worth logging, not before.
+        // (Mutating a Swift Dictionary inside `for` is safe: the loop iterates a
+        // value-semantics snapshot, not the live storage.)
+        for (pid, entry) in pendingQuit where !live.contains(pid) {
+            if Date().timeIntervalSince(entry.at) <= quitLogWindow {
+                guardDeckLog(title: "Quit \(entry.name)", detail: "last window closed, app exited")
+            }
+            pendingQuit.removeValue(forKey: pid)
+        }
+        // An entry past the window can never log, so it has no reason to exist:
+        // dropping it also ends the (theoretical) wrong-name-on-pid-reuse case and
+        // stops a refused, forever-windowless app pinning an entry for good.
+        pendingQuit = pendingQuit.filter { Date().timeIntervalSince($0.value.at) <= quitLogWindow }
 
         hadWindows.formIntersection(live)
         zeroPolls = zeroPolls.filter { live.contains($0.key) }
