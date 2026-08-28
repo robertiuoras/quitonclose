@@ -984,19 +984,27 @@ func runSelfTest() -> Never {
     // Let the Monitor's launch grace period elapse, then close the window.
     _ = wait(seconds: launchGrace + 1) { false }
 
-    say("2. closing its last window ...")
+    // EVERY window, not just the first. TextEdit reopens the documents it had
+    // open last time, so this run found 2 windows and closing one left the app
+    // correctly un-quit — a red test that said nothing about the quit logic
+    // (2026-08-28). "Last window closed" is only true once none are left.
+    say("2. closing its windows ...")
     let axApp = AXUIElementCreateApplication(app.processIdentifier)
     var windowsRef: CFTypeRef?
     guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
-          let windows = windowsRef as? [AXUIElement], let window = windows.first
+          let windows = windowsRef as? [AXUIElement], !windows.isEmpty
     else { fail("could not read TextEdit's windows") }
+    say("   \(windows.count) window(s) to close")
 
-    var closeRef: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &closeRef) == .success,
-          let closeButton = closeRef, CFGetTypeID(closeButton) == AXUIElementGetTypeID()
-    else { fail("window has no close button") }
-    let pressed = AXUIElementPerformAction(closeButton as! AXUIElement, kAXPressAction as CFString)
-    guard pressed == .success else { fail("pressing the close button failed (\(pressed.rawValue))") }
+    for window in windows {
+        var closeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &closeRef) == .success,
+              let closeButton = closeRef, CFGetTypeID(closeButton) == AXUIElementGetTypeID()
+        else { fail("window has no close button") }
+        let pressed = AXUIElementPerformAction(closeButton as! AXUIElement, kAXPressAction as CFString)
+        guard pressed == .success else { fail("pressing the close button failed (\(pressed.rawValue))") }
+        _ = wait(seconds: 0.5) { false }
+    }
 
     say("3. waiting for QuitOnClose to terminate it ...")
     let start = Date()
