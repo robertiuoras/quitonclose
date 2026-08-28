@@ -17,6 +17,16 @@ private let windowlessSecondsToRecommend: Double = 15
 /// feeling instant while surviving the brief window-less moment some apps have
 /// while swapping one window for another (e.g. Xcode, Safari tab-to-window).
 private let zeroPollsBeforeQuit = 2
+/// Number of consecutive zero-window polls before quitting an app that was
+/// ALREADY windowless when QuitOnClose started watching it (login, an app
+/// restart, a crash restore). Such an app never showed a window under our
+/// watch, so the short streak above would fire on a background agent that was
+/// simply never going to open one. 60s is far longer than the normal
+/// close-a-window path, so the two cases cannot be confused.
+/// Measured 2026-08-28: Chrome sat windowless in alt-tab for 4d21h because
+/// this path did not exist at all and the app was never quit for the whole
+/// session.
+private let coldPollsBeforeQuit = Int(60 / pollInterval)
 /// Never quit an app within this many seconds of launch.
 private let launchGrace: TimeInterval = 3
 /// An app that is still burning this much CPU (itself plus its helper
@@ -242,7 +252,9 @@ enum QuitDecision: Equatable {
     /// The app is asking the human something. Never quit over a dialog, and
     /// never let a dialog re-arm the quit.
     case dialogOpen
-    /// Never showed a window under our watch, so it is background-only.
+    /// Was already windowless when we started watching, and has not yet been
+    /// windowless for `coldPollsBeforeQuit`. It still gets quit once that
+    /// longer streak is met; until then it is left alone.
     case neverShowedWindow
     /// Still working with no window. Wait for it to go quiet.
     case busy(Double)
@@ -264,8 +276,15 @@ func quitDecision(scan: WindowScan,
     if scan.real > 0 { return .hasWindows }
     if scan.dialogs > 0 { return .dialogOpen }
     if askedAlready { return .alreadyAsked }
-    if !hadRealWindow { return .neverShowedWindow }
     if let cpu = cpuPercent, cpu > busyCPUPercent { return .busy(cpu) }
+    // An app that was already windowless when we started watching is quit too,
+    // just on a much longer streak. Requiring a window we personally saw open
+    // and close meant an app that was windowless at login was never quit for
+    // the rest of the session, which is the common case on a machine that
+    // restores apps at startup.
+    if !hadRealWindow {
+        return streak < coldPollsBeforeQuit ? .neverShowedWindow : .quit
+    }
     if streak < zeroPollsBeforeQuit { return .waitForStreak }
     return .quit
 }
@@ -415,7 +434,11 @@ final class Monitor {
             // every ticked app would not be free.
             let cpu = scan.real == 0 && scan.dialogs == 0 ? cpuPercent(pid) : nil
 
-            if scan.real == 0 && scan.dialogs == 0 && hadWindows.contains(pid) {
+            // Counted for every windowless poll, not only for apps we watched
+            // open a window: `quitDecision` is what decides how long a streak
+            // has to be, and an app that was windowless from the start needs
+            // the streak counted from the start to ever reach `coldPollsBeforeQuit`.
+            if scan.real == 0 && scan.dialogs == 0 {
                 zeroPolls[pid] = (zeroPolls[pid] ?? 0) + 1
             } else if scan.real > 0 {
                 zeroPolls[pid] = 0
@@ -1402,9 +1425,32 @@ func runMenuTest() -> Never {
     check(quitDecision(scan: windowed, hadRealWindow: false, askedAlready: true,
                        streak: 99, cpuPercent: 0) == .hasWindows,
           "a real window re-arms an app that refused an earlier quit")
+    // An app that was already windowless when QuitOnClose launched (login, an
+    // app restart, a crash restore). Before 2026-08-28 this returned
+    // .neverShowedWindow forever and the app was never quit for the whole
+    // session — Chrome sat in alt-tab windowless for 4d21h.
     check(quitDecision(scan: bare, hadRealWindow: false, askedAlready: false,
-                       streak: 99, cpuPercent: 0) == .neverShowedWindow,
-          "an app that never showed a window is left alone")
+                       streak: coldPollsBeforeQuit, cpuPercent: 0) == .quit,
+          "an app that was already windowless at launch is quit after the long streak")
+    check(quitDecision(scan: bare, hadRealWindow: false, askedAlready: false,
+                       streak: coldPollsBeforeQuit - 1, cpuPercent: 0) == .neverShowedWindow,
+          "an already-windowless app is not quit before the long streak")
+    check(quitDecision(scan: bare, hadRealWindow: false, askedAlready: false,
+                       streak: zeroPollsBeforeQuit, cpuPercent: 0) == .neverShowedWindow,
+          "the short close-a-window streak does not quit an already-windowless app")
+    check(quitDecision(scan: bare, hadRealWindow: false, askedAlready: false,
+                       streak: coldPollsBeforeQuit * 10,
+                       cpuPercent: busyCPUPercent + 10) == .busy(busyCPUPercent + 10),
+          "an already-windowless app that is still working is spared")
+    check(quitDecision(scan: bare, hadRealWindow: false, askedAlready: true,
+                       streak: coldPollsBeforeQuit * 10, cpuPercent: 0) == .alreadyAsked,
+          "an already-windowless app that refused a quit is not asked again")
+
+    // The opt-in gate itself: an app nobody ticked is never even scanned, so
+    // no streak can ever quit it. This is the check the whole tool rests on.
+    let unticked = "com.quitonclose.test.unticked"
+    check(!Store.shared.isEnabled(unticked),
+          "an app that was never ticked is not enabled, so tick() skips it entirely")
 
     // --- the menu itself ---------------------------------------------------
     let application = NSApplication.shared
