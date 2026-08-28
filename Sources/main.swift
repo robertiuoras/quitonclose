@@ -1242,7 +1242,18 @@ func runDialogTest() -> Never {
     say("1. building the victim app ...")
     let compile = Process()
     compile.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    compile.arguments = ["swiftc", "-O", sourceURL.path, "-framework", "Cocoa",
+    // An explicit deployment target is required, not cosmetic: without it swiftc
+    // stamps LC_BUILD_VERSION minos with the SDK's NEXT major (28.0 on a macOS 27
+    // box), and LaunchServices then refuses the bundle with
+    // kLSIncompatibleSystemVersionErr (-10825), so the victim never launches and
+    // the test fails before it tests anything. Measured 2026-08-28.
+#if arch(x86_64)
+    let victimTarget = "x86_64-apple-macos13.0"
+#else
+    let victimTarget = "arm64-apple-macos13.0"
+#endif
+    compile.arguments = ["swiftc", "-O", "-target", victimTarget,
+                         sourceURL.path, "-framework", "Cocoa",
                          "-o", macOS.appendingPathComponent("Victim").path]
     try? compile.run()
     compile.waitUntilExit()
