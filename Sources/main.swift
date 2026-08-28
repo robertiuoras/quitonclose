@@ -1357,6 +1357,129 @@ func runDialogTest() -> Never {
     exit(0)
 }
 
+// MARK: - Cold test
+
+/// A .regular app that opens NO window at all, ever. Stands in for the real
+/// case: an app that was already sitting windowless when QuitOnClose started
+/// watching it (login, an app restart, a crash restore).
+private let coldVictimSource = """
+import Cocoa
+
+final class ColdDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ note: Notification) {
+        // No window. Nothing to close. Just sit here like Chrome did.
+    }
+}
+
+let app = NSApplication.shared
+let delegate = ColdDelegate()
+app.delegate = delegate
+app.setActivationPolicy(.regular)
+app.run()
+"""
+
+/// Proves an app that was ALREADY windowless when QuitOnClose started watching
+/// is still quit, against a real app that really never shows a window.
+///
+/// Before this fix `quitDecision` returned `.neverShowedWindow` forever for such
+/// an app, so it was never quit for the rest of the session — Chrome sat in
+/// alt-tab windowless for 4d21h (2026-08-28).
+///
+/// Run:  /Applications/QuitOnClose.app/Contents/MacOS/QuitOnClose --coldtest
+func runColdTest() -> Never {
+    func say(_ message: String) { print(message) }
+    func fail(_ message: String) -> Never { say("FAIL: \(message)"); exit(1) }
+
+    guard AXIsProcessTrusted() else {
+        fail("no Accessibility permission for this process, so nothing can be observed")
+    }
+
+    let bundleID = "com.quitonclose.test.coldvictim"
+    let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("qoc-coldtest")
+    let appURL = root.appendingPathComponent("ColdVictim.app")
+    let macOS = appURL.appendingPathComponent("Contents/MacOS")
+    try? FileManager.default.removeItem(at: root)
+    try? FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
+
+    let sourceURL = root.appendingPathComponent("cold.swift")
+    try? coldVictimSource.write(to: sourceURL, atomically: true, encoding: .utf8)
+    let plist = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>
+      <key>CFBundleExecutable</key><string>ColdVictim</string>
+      <key>CFBundleIdentifier</key><string>\(bundleID)</string>
+      <key>CFBundleName</key><string>ColdVictim</string>
+      <key>CFBundlePackageType</key><string>APPL</string>
+    </dict></plist>
+    """
+    try? plist.write(to: appURL.appendingPathComponent("Contents/Info.plist"),
+                     atomically: true, encoding: .utf8)
+
+    say("1. building a victim that never opens a window ...")
+    let compile = Process()
+    compile.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+#if arch(x86_64)
+    let coldTarget = "x86_64-apple-macos13.0"
+#else
+    let coldTarget = "arm64-apple-macos13.0"
+#endif
+    compile.arguments = ["swiftc", "-O", "-target", coldTarget,
+                         sourceURL.path, "-framework", "Cocoa",
+                         "-o", macOS.appendingPathComponent("ColdVictim").path]
+    try? compile.run()
+    compile.waitUntilExit()
+    guard compile.terminationStatus == 0 else { fail("could not compile the cold victim (swiftc missing?)") }
+
+    func victim() -> NSRunningApplication? {
+        NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == bundleID && !$0.isTerminated }
+    }
+    func wait(seconds: TimeInterval, for check: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if check() { return true }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        }
+        return check()
+    }
+
+    say("2. launching it and letting it settle windowless ...")
+    let config = NSWorkspace.OpenConfiguration()
+    config.activates = false
+    var launchError: Error?
+    NSWorkspace.shared.openApplication(at: appURL, configuration: config) { _, error in launchError = error }
+    guard wait(seconds: 20, for: { victim() != nil }) else {
+        fail("the cold victim never launched (\(launchError.map { "\($0)" } ?? "no launch error"))")
+    }
+    guard let running = victim() else { fail("the cold victim vanished") }
+    let pid = running.processIdentifier
+
+    // The monitor is started AFTER the victim is already up and windowless, which
+    // is exactly the situation the fix is about: it never sees a window open.
+    let monitor = Monitor()
+    Store.shared.enableEphemeral(bundleID)
+    monitor.start()
+
+    _ = wait(seconds: 2) { false }
+    guard let scan = monitor.scanWindows(pid) else { fail("could not scan the cold victim") }
+    say("   pid \(pid), windows=\(scan)")
+    guard scan.real == 0 && scan.dialogs == 0 else { fail("the cold victim opened a window; it must not") }
+
+    let coldSeconds = Double(coldPollsBeforeQuit) * pollInterval
+    say("3. checking it is NOT quit early (watching \(Int(coldSeconds / 2))s, half the streak) ...")
+    if wait(seconds: coldSeconds / 2, for: { victim() == nil }) {
+        fail("quit before the \(Int(coldSeconds))s streak was met")
+    }
+    say("   still running, as it should be")
+
+    say("4. waiting for the \(Int(coldSeconds))s streak to complete ...")
+    guard wait(seconds: coldSeconds, for: { victim() == nil }) else {
+        fail("an already-windowless app was never quit — this is the 2026-08-28 bug")
+    }
+    say("PASS: an app that was already windowless when watching started was quit after \(Int(coldSeconds))s, and not before")
+    exit(0)
+}
+
 // MARK: - Menu test
 
 /// Proves the two menu promises without a human clicking anything:
@@ -1550,6 +1673,9 @@ if CommandLine.arguments.contains("--cputest") {
     runCPUTest()
 }
 
+if CommandLine.arguments.contains("--coldtest") {
+    runColdTest()
+}
 if CommandLine.arguments.contains("--dialogtest") {
     runDialogTest()
 }
