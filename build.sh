@@ -62,9 +62,49 @@ echo "==> built $APP"
 lipo -archs "$MACOS/$NAME"
 
 if [[ "${1:-}" == "--install" ]]; then
-    pkill -x "$NAME" 2>/dev/null || true
-    rm -rf "/Applications/$NAME.app"
-    cp -R "$APP" "/Applications/$NAME.app"
+    stage=$(mktemp -d "/Applications/.QuitOnClose-install.XXXXXX")
+    cp -R "$APP" "$stage/$NAME.app"
+    codesign --verify --deep --strict "$stage/$NAME.app"
+    # Old installations used a KeepAlive LaunchAgent as well as Open at Login.
+    # Stop it before replacing the executable, otherwise it restarts mid-copy
+    # and creates a second independent menu. Preserve the plist for rollback.
+    legacy="$HOME/Library/LaunchAgents/com.robert.quitonclose.plist"
+    migrated_login=false
+    legacy_was_loaded=false
+    legacy_backup=""
+    rollback_install() {
+        trap - ERR
+        if [[ -d "$stage/previous.app" ]]; then
+            if [[ -d "/Applications/$NAME.app" ]]; then mv "/Applications/$NAME.app" "$stage/failed.app"; fi
+            mv "$stage/previous.app" "/Applications/$NAME.app"
+        fi
+        if [[ -n "$legacy_backup" && -f "$legacy_backup" ]]; then mv "$legacy_backup" "$legacy"; fi
+        if [[ "$legacy_was_loaded" == true ]]; then
+            launchctl bootstrap "gui/$(id -u)" "$legacy"
+        elif [[ -d "/Applications/$NAME.app" ]]; then
+            open "/Applications/$NAME.app"
+        fi
+        exit 1
+    }
+    trap rollback_install ERR
+    if [[ -f "$legacy" ]]; then
+        if launchctl print "gui/$(id -u)/com.robert.quitonclose" >/dev/null 2>&1; then
+            legacy_was_loaded=true
+            launchctl bootout "gui/$(id -u)/com.robert.quitonclose"
+        fi
+        legacy_backup="${legacy}.disabled-$(date +%Y%m%d%H%M%S)"
+        mv "$legacy" "$legacy_backup"
+        migrated_login=true
+    fi
+    "$MACOS/$NAME" --stop-existing
+    if [[ -d "/Applications/$NAME.app" ]]; then
+        mv "/Applications/$NAME.app" "$stage/previous.app"
+    fi
+    mv "$stage/$NAME.app" "/Applications/$NAME.app"
     echo "==> installed /Applications/$NAME.app"
+    if [[ "$migrated_login" == true ]]; then
+        "/Applications/$NAME.app/Contents/MacOS/$NAME" --register-login
+    fi
     open "/Applications/$NAME.app"
+    trap - ERR
 fi

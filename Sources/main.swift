@@ -1718,7 +1718,8 @@ func runMenuTest() -> Never {
           "an app that was never ticked is not enabled, so tick() skips it entirely")
 
     // --- the menu itself ---------------------------------------------------
-    let application = NSApplication.shared
+    guard let instanceLock = InstanceLock() else { exit(0) }
+let application = NSApplication.shared
     application.setActivationPolicy(.accessory)
 
     let rowID = "com.quitonclose.test.menu"
@@ -1791,6 +1792,28 @@ func runMenuTest() -> Never {
     exit(1)
 }
 
+if CommandLine.arguments.contains("--stop-existing") { exit(stopExistingInstances()) }
+if CommandLine.arguments.contains("--register-login") {
+    do {
+        if SMAppService.mainApp.status != .enabled { try SMAppService.mainApp.register() }
+        guard SMAppService.mainApp.status == .enabled else {
+            print("Open at Login requires approval; preserving previous startup path")
+            exit(1)
+        }
+        print("Open at Login: enabled")
+        exit(0)
+    } catch { print("Open at Login registration failed: \(error.localizedDescription)"); exit(1) }
+}
+if CommandLine.arguments.contains("--locktest") {
+    var first: InstanceLock? = InstanceLock()
+    guard first != nil else { print("FAIL: lock unavailable"); exit(1) }
+    guard InstanceLock() == nil else { print("FAIL: duplicate acquired lock"); exit(1) }
+    first = nil
+    guard let replacement = InstanceLock() else { print("FAIL: lock not released"); exit(1) }
+    withExtendedLifetime(replacement) { print("PASS: exclusive lock and clean restart") }
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--permcheck") {
     runPermCheck()
 }
@@ -1819,6 +1842,7 @@ if CommandLine.arguments.contains("--selftest") {
     runSelfTest()
 }
 
+guard let instanceLock = InstanceLock() else { exit(0) }
 let application = NSApplication.shared
 let delegate = AppDelegate()
 application.delegate = delegate
