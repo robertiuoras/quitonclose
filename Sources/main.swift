@@ -1,5 +1,6 @@
 import Cocoa
 import ApplicationServices
+import CoreAudio
 import ServiceManagement
 
 // MARK: - Config
@@ -36,6 +37,16 @@ private let launchGrace: TimeInterval = 3
 /// goes quiet. Measured 2026-08-20: idle ChatGPT is 0.0% across its 19
 /// processes, so a threshold this low still never fires on an idle app.
 private let busyCPUPercent: Double = 8
+/// An app whose whole job is to keep running windowless (music, calls,
+/// downloads) that the human ticked anyway is quit only once it has been idle
+/// this long. The window closing is not the end of using Spotify: the track is
+/// often still playing, and a pause is often a pause, not a finish. Robert
+/// 2026-09-05: "shouldn't kill Spotify that quick after pausing, give at least
+/// 5 mins since last used".
+private let keepsWorkingIdleSeconds: TimeInterval = 300
+/// How long a system-audio reading is reused. The poll runs twice a second for
+/// every ticked app; the answer cannot change meaningfully inside 2s.
+private let audioCheckTTL: TimeInterval = 2
 
 private let neverQuit: Set<String> = [
     "com.apple.finder",
@@ -46,6 +57,50 @@ private let neverQuit: Set<String> = [
     "com.apple.loginwindow",
     Bundle.main.bundleIdentifier ?? "",
 ]
+
+// MARK: - Audio
+
+/// True while the default output device is actually playing something.
+///
+/// Per-app playback is not readable before macOS 14, and this build targets 13,
+/// so the question answered here is the system one. That is the safe direction:
+/// a media app is spared while ANY audio plays, and the only cost is that a
+/// ticked media app outlives a song coming from somewhere else. Quitting Spotify
+/// mid-track is the failure worth ruling out.
+private var audioCache: (running: Bool, at: Date)?
+
+func systemAudioRunning() -> Bool {
+    if let cached = audioCache, Date().timeIntervalSince(cached.at) < audioCheckTTL {
+        return cached.running
+    }
+    let running = readSystemAudioRunning()
+    audioCache = (running, Date())
+    return running
+}
+
+private func readSystemAudioRunning() -> Bool {
+    var deviceAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var device = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                     &deviceAddress, 0, nil, &size, &device) == noErr,
+          device != kAudioObjectUnknown
+    else { return false }
+
+    var runningAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var running = UInt32(0)
+    var runningSize = UInt32(MemoryLayout<UInt32>.size)
+    guard AudioObjectGetPropertyData(device, &runningAddress, 0, nil,
+                                     &runningSize, &running) == noErr
+    else { return false }
+    return running != 0
+}
 
 // MARK: - Advice
 
@@ -262,6 +317,9 @@ enum QuitDecision: Equatable {
     case alreadyAsked
     /// Windowless, but not for long enough yet.
     case waitForStreak
+    /// An app that keeps working without a window (music, calls, downloads) and
+    /// was used, or was playing audio, inside the last `keepsWorkingIdleSeconds`.
+    case keepsWorkingIdle
     case quit
 }
 
@@ -272,11 +330,17 @@ func quitDecision(scan: WindowScan,
                   hadRealWindow: Bool,
                   askedAlready: Bool,
                   streak: Int,
-                  cpuPercent: Double?) -> QuitDecision {
+                  cpuPercent: Double?,
+                  keepsWorkingIdleFor: TimeInterval? = nil) -> QuitDecision {
     if scan.real > 0 { return .hasWindows }
     if scan.dialogs > 0 { return .dialogOpen }
     if askedAlready { return .alreadyAsked }
     if let cpu = cpuPercent, cpu > busyCPUPercent { return .busy(cpu) }
+    // A ticked music/calls/downloads app gets a much longer wait than the
+    // window-close streak: closing the window is not the end of using it.
+    if let idle = keepsWorkingIdleFor, idle < keepsWorkingIdleSeconds {
+        return .keepsWorkingIdle
+    }
     // An app that was already windowless when we started watching is quit too,
     // just on a much longer streak. Requiring a window we personally saw open
     // and close meant an app that was windowless at login was never quit for
@@ -371,6 +435,9 @@ final class Monitor {
     private let quitLogWindow: TimeInterval = 60
     /// pid -> (total CPU seconds, when it was read), for the busy check.
     private var cpuSamples = [pid_t: (seconds: Double, at: Date)]()
+    /// pid -> when a keeps-working app (music, calls, downloads) last looked in
+    /// use: a real window, the app in front, or audio coming out of the machine.
+    private var lastUsed = [pid_t: Date]()
 
     func start() {
         timer?.invalidate()
@@ -434,6 +501,22 @@ final class Monitor {
             // every ticked app would not be free.
             let cpu = scan.real == 0 && scan.dialogs == 0 ? cpuPercent(pid) : nil
 
+            // Music, calls and downloads are the apps whose window closing says
+            // nothing about whether they are finished. For those only, track
+            // when they last looked in use and hold the quit until it has been
+            // quiet for `keepsWorkingIdleSeconds`.
+            var idleFor: TimeInterval? = nil
+            if keepsWorkingReason(bundleID) != nil {
+                if scan.real > 0 || app.isActive || systemAudioRunning() {
+                    lastUsed[pid] = Date()
+                }
+                // Never seen in use yet (QuitOnClose started after it did): the
+                // clock starts now, so it still gets the full grace.
+                let since = lastUsed[pid] ?? Date()
+                lastUsed[pid] = since
+                idleFor = Date().timeIntervalSince(since)
+            }
+
             // Counted for every windowless poll, not only for apps we watched
             // open a window: `quitDecision` is what decides how long a streak
             // has to be, and an app that was windowless from the start needs
@@ -450,10 +533,13 @@ final class Monitor {
                                         hadRealWindow: hadWindows.contains(pid),
                                         askedAlready: askedQuit.contains(pid),
                                         streak: zeroPolls[pid] ?? 0,
-                                        cpuPercent: cpu)
+                                        cpuPercent: cpu,
+                                        keepsWorkingIdleFor: idleFor)
             debugLog("\(bundleID): real=\(scan.real) dialogs=\(scan.dialogs) "
                      + "cpu=\(cpu.map { String(format: "%.1f%%", $0) } ?? "?") "
-                     + "streak=\(zeroPolls[pid] ?? 0) -> \(decision)")
+                     + "streak=\(zeroPolls[pid] ?? 0) "
+                     + (idleFor.map { String(format: "idle=%.0fs ", $0) } ?? "")
+                     + "-> \(decision)")
 
             switch decision {
             case .hasWindows:
@@ -468,7 +554,8 @@ final class Monitor {
                 askedQuit.insert(pid)
                 pendingQuit[pid] = (app.localizedName ?? bundleID, Date())
                 app.terminate()  // graceful: an app with unsaved work still gets to ask
-            case .dialogOpen, .neverShowedWindow, .busy, .alreadyAsked, .waitForStreak:
+            case .dialogOpen, .neverShowedWindow, .busy, .alreadyAsked, .waitForStreak,
+                 .keepsWorkingIdle:
                 break
             }
         }
@@ -493,6 +580,7 @@ final class Monitor {
         firstSeen = firstSeen.filter { live.contains($0.key) }
         askedQuit.formIntersection(live)
         cpuSamples = cpuSamples.filter { live.contains($0.key) }
+        lastUsed = lastUsed.filter { live.contains($0.key) }
     }
 
     /// Real windows only, for the survey and the self test.
@@ -1567,6 +1655,39 @@ func runMenuTest() -> Never {
     check(quitDecision(scan: windowed, hadRealWindow: false, askedAlready: true,
                        streak: 99, cpuPercent: 0) == .hasWindows,
           "a real window re-arms an app that refused an earlier quit")
+
+    // Music, calls and downloads. Before 2026-09-05 Spotify was quit ~1s after
+    // its window closed, while the track was often still playing or paused
+    // mid-listen.
+    check(quitDecision(scan: bare, hadRealWindow: true, askedAlready: false,
+                       streak: 99, cpuPercent: 0,
+                       keepsWorkingIdleFor: 1) == .keepsWorkingIdle,
+          "a music app is not quit a second after its window closed")
+    check(quitDecision(scan: bare, hadRealWindow: true, askedAlready: false,
+                       streak: 99, cpuPercent: 0,
+                       keepsWorkingIdleFor: keepsWorkingIdleSeconds - 1) == .keepsWorkingIdle,
+          "a music app is still spared just under the five minutes")
+    check(quitDecision(scan: bare, hadRealWindow: true, askedAlready: false,
+                       streak: 99, cpuPercent: 0,
+                       keepsWorkingIdleFor: keepsWorkingIdleSeconds) == .quit,
+          "a music app idle for the full five minutes is quit")
+    check(quitDecision(scan: bare, hadRealWindow: false, askedAlready: false,
+                       streak: coldPollsBeforeQuit, cpuPercent: 0,
+                       keepsWorkingIdleFor: 1) == .keepsWorkingIdle,
+          "the already-windowless path does not skip the idle wait either")
+    check(quitDecision(scan: asking, hadRealWindow: true, askedAlready: false,
+                       streak: 99, cpuPercent: 0,
+                       keepsWorkingIdleFor: 9999) == .dialogOpen,
+          "a dialog still outranks the idle wait")
+    check(keepsWorkingReason("com.spotify.client") != nil,
+          "Spotify is a keeps-working app, so the idle wait applies to it")
+    check(keepsWorkingReason("com.apple.Notes") == nil,
+          "an ordinary app gets no idle wait and still quits on close")
+    // Reading the audio device must never throw or hang; the value depends on
+    // what the machine is doing, so only the read itself is asserted.
+    let audio = systemAudioRunning()
+    check(systemAudioRunning() == audio,
+          "the system-audio read answers, and the cached second read agrees")
     // An app that was already windowless when QuitOnClose launched (login, an
     // app restart, a crash restore). Before 2026-08-28 this returned
     // .neverShowedWindow forever and the app was never quit for the whole

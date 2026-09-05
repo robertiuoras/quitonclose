@@ -13,7 +13,7 @@ BUILD="$DIR/build"
 APP="$BUILD/$NAME.app"
 MACOS="$APP/Contents/MacOS"
 
-FRAMEWORKS=(-framework Cocoa -framework ApplicationServices -framework ServiceManagement)
+FRAMEWORKS=(-framework Cocoa -framework ApplicationServices -framework ServiceManagement -framework CoreAudio)
 SOURCES=("$DIR"/Sources/*.swift)
 
 rm -rf "$APP"
