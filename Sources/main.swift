@@ -857,9 +857,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var permissionTimer: Timer?
     private var lastTrusted: Bool?
     private let monitor = Monitor()
-    /// Recommended apps not yet ticked, filled while the menu is built so the
-    /// "tick all recommended" item knows what it would turn on.
-    private var offToRecommend: [String] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -917,75 +914,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
         }
 
-        menu.addItem(caption("Tick every app that should quit when its last window closes."))
-        menu.addItem(caption("The menu stays open, so tick as many as you like."))
+        let smart = NSMenuItem(title: "Intelligent closing", action: #selector(toggleIntelligent), keyEquivalent: "")
+        smart.target = self
+        smart.state = Store.shared.intelligent ? .on : .off
+        menu.addItem(smart)
+        menu.addItem(caption(Store.shared.intelligent
+            ? "Closes supported apps after their last foreground use."
+            : "Manual mode: choose a closing rule for each app below."))
+        menu.addItem(caption("Active apps, dialogs and background work stay protected."))
 
-        let running = NSWorkspace.shared.runningApplications
-            .filter { $0.activationPolicy == .regular }
-            .filter { app in
-                guard let id = app.bundleIdentifier else { return false }
-                return !neverQuit.contains(id)
+        if Store.shared.intelligent {
+            let timing = NSMenuItem(title: Store.shared.automaticIdle.title, action: nil, keyEquivalent: "")
+            let choices = NSMenu()
+            for rule in ClosingRule.allCases where rule.seconds != nil {
+                let choice = NSMenuItem(title: rule.title, action: #selector(setAutomaticIdle(_:)), keyEquivalent: "")
+                choice.target = self
+                choice.representedObject = rule.rawValue
+                choice.state = Store.shared.automaticIdle == rule ? .on : .off
+                choices.addItem(choice)
             }
-            .sorted { ($0.localizedName ?? "") .localizedCaseInsensitiveCompare($1.localizedName ?? "") == .orderedAscending }
-
-        var listed = Set<String>()
-        var recommended: [(String, String, NSImage?)] = []
-        var others: [(String, String, NSImage?, String)] = []
-
-        for app in running {
-            guard let id = app.bundleIdentifier, listed.insert(id).inserted else { continue }
-            let name = app.localizedName ?? id
-            switch advice(for: id) {
-            case .recommended: recommended.append((id, name, app.icon))
-            case .keepsWorking(let why): others.append((id, name, app.icon, why))
-            case .unknown: others.append((id, name, app.icon, ""))
-            }
+            timing.submenu = choices
+            menu.addItem(timing)
         }
-
-        offToRecommend = recommended.map(\.0).filter { !Store.shared.isEnabled($0) }
-
-        if !recommended.isEmpty {
-            menu.addItem(.separator())
-            menu.addItem(header("Recommended: these stay running with no window"))
-            for (id, name, icon) in recommended {
-                menu.addItem(row(bundleID: id, title: name, icon: icon, note: "recommended", recommended: true))
-            }
-        }
-
-        if !others.isEmpty {
-            menu.addItem(.separator())
-            menu.addItem(header(recommended.isEmpty ? "Running apps" : "Other running apps"))
-            for (id, name, icon, why) in others {
-                menu.addItem(row(bundleID: id, title: name, icon: icon, note: why, recommended: false))
-            }
-        }
-
-        // Enabled apps that are not running right now, so they can still be turned off.
-        let offline = Store.shared.enabled.subtracting(listed).sorted()
-        if !offline.isEmpty {
-            menu.addItem(.separator())
-            menu.addItem(header("Ticked but not running"))
-            for id in offline {
-                let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id)
-                let name = url.flatMap { FileManager.default.displayName(atPath: $0.path) } ?? id
-                let icon = url.map { NSWorkspace.shared.icon(forFile: $0.path) }
-                menu.addItem(row(bundleID: id, title: name, icon: icon, note: "", recommended: false))
-            }
-        }
-
         menu.addItem(.separator())
-
-        if !offToRecommend.isEmpty {
-            let all = NSMenuItem(title: "Tick all \(offToRecommend.count) recommended",
-                                 action: #selector(enableAllRecommended), keyEquivalent: "")
-            all.target = self
-            menu.addItem(all)
+        menu.addItem(header(Store.shared.intelligent ? "Automatic rules" : "Manual rules"))
+        let apps = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
+        let ids = Set(apps.compactMap(\.bundleIdentifier))
+            .union(Store.shared.enabled).union(Store.shared.manualRules.keys)
+            .filter { !neverQuit.contains($0) }
+        let named = ids.map { id -> (String, String) in
+            let app = apps.first { $0.bundleIdentifier == id }
+            let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id)
+            return (id, app?.localizedName ?? url.map { FileManager.default.displayName(atPath: $0.path) } ?? id)
+        }.sorted { $0.1.localizedCaseInsensitiveCompare($1.1) == .orderedAscending }
+        for (id, name) in named {
+            let rule = Store.shared.rule(id)
+            let item = NSMenuItem(title: "\(name): \(rule.title)", action: nil, keyEquivalent: "")
+            let submenu = NSMenu()
+            if id == "com.apple.finder" {
+                submenu.addItem(caption("Closes Finder windows; keeps your desktop running."))
+            }
+            if remoteDesktopApps.contains(id) {
+                let allow = NSMenuItem(title: "Allow idle closing with windows open",
+                                      action: #selector(toggleRemoteWindows), keyEquivalent: "")
+                allow.target = self
+                allow.state = Store.shared.allowRemoteWindows ? .on : .off
+                submenu.addItem(allow)
+                submenu.addItem(caption("May disconnect a remote session. Off keeps its windows open."))
+            }
+            if protectedWork(id) {
+                submenu.addItem(caption("Protected: background work cannot be safely detected."))
+            } else if Store.shared.intelligent {
+                submenu.addItem(caption("Turn Intelligent closing off to choose a manual rule."))
+            } else {
+                for option in ClosingRule.allCases {
+                    if id == "com.apple.finder" && option == .onClose { continue }
+                    let choice = NSMenuItem(title: option.title, action: #selector(setManualRule(_:)), keyEquivalent: "")
+                    choice.target = self
+                    choice.representedObject = [id, option.rawValue]
+                    choice.state = rule == option ? .on : .off
+                    submenu.addItem(choice)
+                }
+            }
+            item.submenu = submenu
+            menu.addItem(item)
         }
-        if !Store.shared.enabled.isEmpty {
-            let none = NSMenuItem(title: "Untick everything", action: #selector(disableEverything), keyEquivalent: "")
-            none.target = self
-            menu.addItem(none)
-        }
+        menu.addItem(.separator())
 
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLoginItem), keyEquivalent: "")
         login.target = self
@@ -994,13 +988,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let quit = NSMenuItem(title: "Quit QuitOnClose", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
-    }
-
-    private func row(bundleID: String, title: String, icon: NSImage?, note: String, recommended: Bool) -> NSMenuItem {
-        let item = NSMenuItem()
-        item.view = AppRowView(bundleID: bundleID, title: title, icon: icon,
-                               note: note, recommended: recommended)
-        return item
     }
 
     private func header(_ text: String) -> NSMenuItem {
@@ -1023,13 +1010,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    @objc private func enableAllRecommended() {
-        offToRecommend.forEach { Store.shared.setEnabled($0, true) }
+    @objc private func toggleIntelligent() {
+        Store.shared.intelligent.toggle()
+        monitor.resetPolicy()
     }
 
-    @objc private func disableEverything() {
-        let current = Store.shared.enabled
-        current.forEach { Store.shared.setEnabled($0, false) }
+    @objc private func toggleRemoteWindows() {
+        Store.shared.allowRemoteWindows.toggle()
+        monitor.resetPolicy()
+    }
+
+    @objc private func setAutomaticIdle(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let rule = ClosingRule(rawValue: raw), rule.seconds != nil else { return }
+        Store.shared.automaticIdle = rule
+        monitor.resetPolicy()
+    }
+
+    @objc private func setManualRule(_ sender: NSMenuItem) {
+        guard let pair = sender.representedObject as? [String], pair.count == 2,
+              let rule = ClosingRule(rawValue: pair[1]) else { return }
+        Store.shared.setRule(pair[0], rule)
+        monitor.resetPolicy()
     }
 
     @objc private func toggleLoginItem() {
@@ -1925,6 +1927,12 @@ if CommandLine.arguments.contains("--register-login") {
         print("Open at Login: enabled")
         exit(0)
     } catch { print("Open at Login registration failed: \(error.localizedDescription)"); exit(1) }
+}
+if let index = CommandLine.arguments.firstIndex(of: "--idletest"), CommandLine.arguments.count > index + 1 {
+    exit(runIdleTest(URL(fileURLWithPath: CommandLine.arguments[index + 1])))
+}
+if CommandLine.arguments.contains("--policytest") {
+    exit(runPolicyTest())
 }
 if CommandLine.arguments.contains("--locktest") {
     var first: InstanceLock? = InstanceLock()
