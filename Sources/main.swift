@@ -49,7 +49,6 @@ private let keepsWorkingIdleSeconds: TimeInterval = 300
 private let audioCheckTTL: TimeInterval = 2
 
 private let neverQuit: Set<String> = [
-    "com.apple.finder",
     "com.apple.dock",
     "com.apple.systemuiserver",
     "com.apple.controlcenter",
@@ -144,6 +143,8 @@ private let keepsWorking: [String: String] = [
     "org.whispersystems.signal-desktop": "alerts",
     "com.facebook.archon": "alerts",
     "com.apple.MobileSMS": "alerts",
+    "net.whatsapp.WhatsApp": "calls and alerts",
+    "com.microsoft.rdc.macos": "remote sessions; windowless only",
     "com.apple.mail": "fetches mail",
     "com.readdle.smartemail-Mac": "fetches mail",
     "com.apple.iCal": "alerts",
@@ -204,6 +205,41 @@ final class Store {
     }
 
     func isEnabled(_ bundleID: String) -> Bool { enabled.contains(bundleID) }
+
+    var intelligent: Bool {
+        get { UserDefaults.standard.bool(forKey: "intelligentClosing") }
+        set { UserDefaults.standard.set(newValue, forKey: "intelligentClosing") }
+    }
+
+    var automaticIdle: ClosingRule {
+        get {
+            let rule = ClosingRule(rawValue: UserDefaults.standard.string(forKey: "automaticIdle") ?? "")
+            return rule?.seconds != nil ? rule! : .idle30
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "automaticIdle") }
+    }
+
+    var manualRules: [String: String] {
+        UserDefaults.standard.dictionary(forKey: "closingRules") as? [String: String] ?? [:]
+    }
+
+    var allowRemoteWindows: Bool {
+        get { UserDefaults.standard.bool(forKey: "allowIdleRemoteWindows") }
+        set { UserDefaults.standard.set(newValue, forKey: "allowIdleRemoteWindows") }
+    }
+
+    func rule(_ id: String) -> ClosingRule {
+        if neverQuit.contains(id) || protectedWork(id) { return .keepOpen }
+        if intelligent { return automaticRule(id, idleRule: automaticIdle) }
+        if let raw = manualRules[id], let value = ClosingRule(rawValue: raw) { return value }
+        return isEnabled(id) ? .onClose : .keepOpen
+    }
+
+    func setRule(_ id: String, _ rule: ClosingRule) {
+        var rules = manualRules
+        rules[id] = rule.rawValue
+        UserDefaults.standard.set(rules, forKey: "closingRules")
+    }
 
     func windowlessSeconds(_ bundleID: String) -> Double { windowless[bundleID] ?? 0 }
 
@@ -438,8 +474,24 @@ final class Monitor {
     /// pid -> when a keeps-working app (music, calls, downloads) last looked in
     /// use: a real window, the app in front, or audio coming out of the machine.
     private var lastUsed = [pid_t: Date]()
+    private var activationObserver: NSObjectProtocol?
+    private var previousWindows = [pid_t: Int]()
+
+    func resetPolicy() {
+        lastUsed.removeAll()
+        zeroPolls.removeAll()
+        cpuSamples.removeAll()
+    }
 
     func start() {
+        if activationObserver == nil {
+            activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+            ) { [weak self] notification in
+                guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+                self?.lastUsed[app.processIdentifier] = Date()
+            }
+        }
         timer?.invalidate()
         let t = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             self?.tick()
@@ -474,21 +526,23 @@ final class Monitor {
         }
     }
 
-    private func tick() {
+    func tick(_ applications: [NSRunningApplication] = NSWorkspace.shared.runningApplications, now: Date = Date()) {
         guard AXIsProcessTrusted() else { return }
 
         var live = Set<pid_t>()
-        for app in NSWorkspace.shared.runningApplications {
+        for app in applications {
             guard let bundleID = app.bundleIdentifier,
                   !neverQuit.contains(bundleID),
-                  Store.shared.isEnabled(bundleID),
+                  Store.shared.rule(bundleID) != .keepOpen,
                   app.activationPolicy == .regular,
                   !app.isTerminated
             else { continue }
 
             let pid = app.processIdentifier
+            let rule = Store.shared.rule(bundleID)
             live.insert(pid)
-            if firstSeen[pid] == nil { firstSeen[pid] = app.launchDate ?? Date() }
+            if firstSeen[pid] == nil { firstSeen[pid] = app.launchDate ?? now }
+            if lastUsed[pid] == nil { lastUsed[pid] = now }
 
             // A nil scan means the app did not answer in time. Treat that as
             // "unknown", never as "no windows".
@@ -496,6 +550,44 @@ final class Monitor {
                 debugLog("\(bundleID): no answer from the Accessibility query, poll ignored")
                 continue
             }
+            let oldCount = previousWindows[pid]
+            previousWindows[pid] = scan.real
+            if askedQuit.contains(pid) && (scan.real > 0 || scan.dialogs > 0) {
+                // Retain the refusal latch but do not attribute a later manual
+                // exit to this request while the app is still showing UI.
+                pendingQuit.removeValue(forKey: pid)
+            }
+            if app.isActive { lastUsed[pid] = now }
+            if oldCount == 0 && scan.real > 0 && scan.dialogs == 0 && app.isActive {
+                askedQuit.remove(pid)
+                pendingQuit.removeValue(forKey: pid)
+            }
+            // Inactivity means time since actual foreground use, including
+            // Cmd-Tab activation. A background window does not reset the clock.
+            if let timeout = rule.seconds {
+                let audio = keepsWorkingReason(bundleID) != nil && systemAudioRunning()
+                if audio { lastUsed[pid] = now }
+                let idle = now.timeIntervalSince(lastUsed[pid] ?? now)
+                let cpu = idle >= timeout - pollInterval ? cpuPercent(pid) : nil
+                let decision = idleDecision(id: bundleID, realWindows: scan.real, dialogs: scan.dialogs,
+                    active: app.isActive, idleFor: idle, timeout: timeout,
+                    asked: askedQuit.contains(pid), cpu: cpu, audioRunning: audio,
+                    allowRemoteWindows: Store.shared.allowRemoteWindows)
+                if decision == .quit {
+                    askedQuit.insert(pid)
+                    if bundleID == "com.apple.finder" {
+                        closeFinderWindows(pid)
+                    } else {
+                        pendingQuit[pid] = (app.localizedName ?? bundleID, now)
+                        app.terminate()
+                    }
+                }
+                continue
+            }
+            // The current app is still in use even if it has no windows.
+            if app.isActive { zeroPolls[pid] = 0; continue }
+            // Finder has a desktop process, not a normal quit-on-close lifecycle.
+            if bundleID == "com.apple.finder" { continue }
             // Only sampled while the app is windowless: that is the only moment
             // it can matter, and walking the process table twice a second for
             // every ticked app would not be free.
@@ -508,13 +600,13 @@ final class Monitor {
             var idleFor: TimeInterval? = nil
             if keepsWorkingReason(bundleID) != nil {
                 if scan.real > 0 || app.isActive || systemAudioRunning() {
-                    lastUsed[pid] = Date()
+                    lastUsed[pid] = now
                 }
                 // Never seen in use yet (QuitOnClose started after it did): the
                 // clock starts now, so it still gets the full grace.
-                let since = lastUsed[pid] ?? Date()
+                let since = lastUsed[pid] ?? now
                 lastUsed[pid] = since
-                idleFor = Date().timeIntervalSince(since)
+                idleFor = now.timeIntervalSince(since)
             }
 
             // Counted for every windowless poll, not only for apps we watched
@@ -527,7 +619,7 @@ final class Monitor {
                 zeroPolls[pid] = 0
             }
 
-            guard Date().timeIntervalSince(firstSeen[pid] ?? .distantPast) > launchGrace else { continue }
+            guard now.timeIntervalSince(firstSeen[pid] ?? .distantPast) > launchGrace else { continue }
 
             let decision = quitDecision(scan: scan,
                                         hadRealWindow: hadWindows.contains(pid),
@@ -544,15 +636,13 @@ final class Monitor {
             switch decision {
             case .hasWindows:
                 hadWindows.insert(pid)
-                // A real window is a fresh chance: whatever happened to the
-                // last quit request, the app is being used again.
-                askedQuit.remove(pid)
-                pendingQuit.removeValue(forKey: pid)
+                // The explicit foreground reopen above re-arms a refused quit.
+                // A background window or settings change must not do so.
             case .quit:
                 zeroPolls[pid] = 0
                 hadWindows.remove(pid)
                 askedQuit.insert(pid)
-                pendingQuit[pid] = (app.localizedName ?? bundleID, Date())
+                pendingQuit[pid] = (app.localizedName ?? bundleID, now)
                 app.terminate()  // graceful: an app with unsaved work still gets to ask
             case .dialogOpen, .neverShowedWindow, .busy, .alreadyAsked, .waitForStreak,
                  .keepsWorkingIdle:
@@ -565,15 +655,15 @@ final class Monitor {
         // (Mutating a Swift Dictionary inside `for` is safe: the loop iterates a
         // value-semantics snapshot, not the live storage.)
         for (pid, entry) in pendingQuit where !live.contains(pid) {
-            if Date().timeIntervalSince(entry.at) <= quitLogWindow {
-                guardDeckLog(title: "Quit \(entry.name)", detail: "last window closed, app exited")
+            if kill(pid, 0) != 0 && errno == ESRCH && now.timeIntervalSince(entry.at) <= quitLogWindow {
+                guardDeckLog(title: "Quit \(entry.name)", detail: "closing rule applied, app exited")
             }
             pendingQuit.removeValue(forKey: pid)
         }
         // An entry past the window can never log, so it has no reason to exist:
         // dropping it also ends the (theoretical) wrong-name-on-pid-reuse case and
         // stops a refused, forever-windowless app pinning an entry for good.
-        pendingQuit = pendingQuit.filter { Date().timeIntervalSince($0.value.at) <= quitLogWindow }
+        pendingQuit = pendingQuit.filter { now.timeIntervalSince($0.value.at) <= quitLogWindow }
 
         hadWindows.formIntersection(live)
         zeroPolls = zeroPolls.filter { live.contains($0.key) }
@@ -581,6 +671,28 @@ final class Monitor {
         askedQuit.formIntersection(live)
         cpuSamples = cpuSamples.filter { live.contains($0.key) }
         lastUsed = lastUsed.filter { live.contains($0.key) }
+        previousWindows = previousWindows.filter { live.contains($0.key) }
+    }
+
+    // Close Finder's ordinary windows through their own close controls. Never
+    // terminate Finder, which would also remove the desktop and relaunch it.
+    private func closeFinderWindows(_ pid: pid_t) {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.3)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement] else { return }
+        for window in windows {
+            // Recheck after each close: a confirmation sheet must stop the batch.
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier != pid,
+                  let scan = scanWindows(pid), scan.dialogs == 0 else { return }
+            var subrole: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(window, kAXSubroleAttribute as CFString, &subrole) == .success,
+                  (subrole as? String) == (kAXStandardWindowSubrole as String) else { continue }
+            var button: CFTypeRef?
+            if AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &button) == .success,
+               let button { AXUIElementPerformAction(button as! AXUIElement, kAXPressAction as CFString) }
+        }
     }
 
     /// Real windows only, for the survey and the self test.
@@ -599,8 +711,19 @@ final class Monitor {
         for window in windows {
             var roleRef: CFTypeRef?
             guard AXUIElementCopyAttributeValue(window, kAXRoleAttribute as CFString, &roleRef) == .success,
-                  let role = roleRef as? String, role == (kAXWindowRole as String)
-            else { continue }
+                  let role = roleRef as? String else { return nil }
+            guard role == (kAXWindowRole as String) else { continue }
+
+            var children: CFTypeRef?
+            let sheetResult = AXUIElementCopyAttributeValue(window, kAXChildrenAttribute as CFString, &children)
+            if sheetResult == .success {
+                guard let childList = children as? [AXUIElement] else { return nil }
+                for child in childList {
+                    var childRole: CFTypeRef?
+                    guard AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &childRole) == .success else { return nil }
+                    if (childRole as? String) == (kAXSheetRole as String) { dialogs += 1 }
+                }
+            } else if sheetResult != .attributeUnsupported && sheetResult != .noValue { return nil }
 
             var subroleRef: CFTypeRef?
             let subrole = AXUIElementCopyAttributeValue(window, kAXSubroleAttribute as CFString, &subroleRef) == .success
@@ -1718,8 +1841,7 @@ func runMenuTest() -> Never {
           "an app that was never ticked is not enabled, so tick() skips it entirely")
 
     // --- the menu itself ---------------------------------------------------
-    guard let instanceLock = InstanceLock() else { exit(0) }
-let application = NSApplication.shared
+    let application = NSApplication.shared
     application.setActivationPolicy(.accessory)
 
     let rowID = "com.quitonclose.test.menu"
@@ -1842,6 +1964,7 @@ if CommandLine.arguments.contains("--selftest") {
     runSelfTest()
 }
 
+// Diagnostic commands above deliberately do not create a monitor or take its lock.
 guard let instanceLock = InstanceLock() else { exit(0) }
 let application = NSApplication.shared
 let delegate = AppDelegate()
