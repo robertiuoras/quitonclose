@@ -1589,7 +1589,9 @@ func runColdTest() -> Never {
 /// queue, which the menu's tracking loop pulls from, not a system-wide CGEvent.
 func runMenuTest() -> Never {
     var failures: [String] = []
+    var ran = 0
     func check(_ condition: Bool, _ what: String) {
+        ran += 1
         print("\(condition ? "ok  " : "FAIL") \(what)")
         if !condition { failures.append(what) }
     }
@@ -1782,7 +1784,7 @@ func runMenuTest() -> Never {
     Store.shared.setEnabled(rowID, false)
 
     if failures.isEmpty {
-        print("PASS: 4 menu checks, 5 advice checks and 9 quit-decision checks")
+        print("PASS: \(ran) checks (menu, advice, quit decision)")
         exit(0)
     }
     print("FAILED: \(failures.count) — \(failures.joined(separator: "; "))")
